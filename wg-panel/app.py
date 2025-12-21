@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WireGuard Web Panel v4
+LeathGuard v4 - WireGuard Web Panel
 
 Features:
 - Realtime auto-refresh (5 second polling)
@@ -2423,27 +2423,10 @@ def api_status():
         'clients': get_clients()
     })
 
-# Alias routes for compatibility
-@app.route('/api/stats')
-@login_required
-def api_stats():
-    return api_status()
-
-@app.route('/api/clients')
-@login_required
-def api_clients():
-    return api_status()
-
 @app.route('/api/history')
 @login_required
 def api_history():
     return jsonify(get_connection_history())
-
-# Alias for /api/activity
-@app.route('/api/activity')
-@login_required
-def api_activity():
-    return api_history()
 
 @app.route('/api/health')
 @login_required
@@ -2512,5 +2495,5 @@ if __name__ == '__main__':
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"WireGuard Panel v4 starting on port {port}")
+    print(f"LeathGuard v4 starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
