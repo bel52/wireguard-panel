@@ -2,12 +2,12 @@
 set -euo pipefail
 
 #
-# WireGuard Panel Installer
+# LeathGuard Installer
 # Installs both wg-tool (CLI) and wg-panel (Web UI)
 #
 
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║           WireGuard Panel Installer                       ║"
+echo "║               LeathGuard Installer                        ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
 echo
 
@@ -70,7 +70,7 @@ chmod 600 "$INSTALL_DIR/wg-panel.db"
 echo "[5/6] Configuring systemd service..."
 cat > /etc/systemd/system/wg-panel.service <<EOF
 [Unit]
-Description=WireGuard Web Panel
+Description=LeathGuard Web Panel
 After=network.target wg-quick@wg0.service
 
 [Service]

@@ -1,4 +1,4 @@
-# WireGuard Panel
+# LeathGuard
 
 A lightweight, self-hosted WireGuard VPN management solution with both CLI and web interfaces. Designed to be simple like PiVPN but with a modern web dashboard.
 
@@ -24,6 +24,16 @@ A lightweight, self-hosted WireGuard VPN management solution with both CLI and w
 - **Connection history** — logs of all connect/disconnect/create/revoke events
 - **Dark/Light mode** — toggle with saved preference
 - **Mobile-friendly** — responsive design
+
+### v4 New Features
+- **Health & Risk Monitoring** — system health card showing WireGuard interface, IP forwarding, and NAT status
+- **Rolling Traffic Stats** — 1h/24h traffic windows with totals preserved
+- **Demo-safe Mode** — one-click redaction of all sensitive IPs and locations for presentations
+- **Collapsible Map** — map collapsed by default, state persists in localStorage
+- **Enhanced Client Controls** — search, filter (All/Connected/Offline/Last 24h), and sort (Name/Handshake/RX/TX)
+- **Compact Actions** — icon buttons with tooltips, copy-to-clipboard for endpoints
+- **Activity Strip** — recent events displayed prominently on dashboard
+- **Last Handshake Badge** — prominent handshake indicator per client
 
 ## Requirements
 
@@ -220,6 +230,9 @@ The web panel can be configured via environment variables in the systemd service
 | `WG_PANEL_USER` | Login username | `admin` |
 | `WG_PANEL_PASS_HASH` | SHA256 hash of password | — |
 | `WG_PANEL_SECRET` | Flask session secret | (random) |
+| `WG_PANEL_DB` | SQLite database path | `/opt/wg-panel/wg-panel.db` |
+| `WG_PANEL_DNS_CHECK` | Enable DNS health check | `false` |
+| `WG_PANEL_DNS_SERVER` | DNS server to check | `10.6.0.1` |
 
 ### Changing the Password
 
@@ -325,4 +338,5 @@ Pull requests welcome. For major changes, please open an issue first.
 
 - Inspired by [PiVPN](https://pivpn.io/)
 - Built with [Flask](https://flask.palletsprojects.com/)
-- Maps powered by [Leaflet](https://leafletjs.com/) (coming soon)
+- Maps powered by [Leaflet](https://leafletjs.com/) with [CartoDB](https://carto.com/) tiles
+- GeoIP data from [ip-api.com](https://ip-api.com/)
