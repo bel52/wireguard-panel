@@ -1,4 +1,4 @@
-# WireGuard Panel
+# LeathGuard
 
 A lightweight, self-hosted WireGuard VPN management solution with both CLI and web interfaces. Designed to be simple like PiVPN but with a modern web dashboard.
 
