@@ -1069,11 +1069,11 @@ TEMPLATE = '''
         
         <div id="dashboard-content">
             <div class="stats-grid" id="stats-grid"></div>
-            <div class="map-container">
-                <div id="client-map"></div>
-            </div>
             <div class="card">
                 <div class="client-grid" id="client-grid"></div>
+            </div>
+            <div class="map-container">
+                <div id="client-map"></div>
             </div>
         </div>
         
@@ -1386,6 +1386,9 @@ TEMPLATE = '''
             // Map initialization
             let clientMap = null;
             let mapMarkers = [];
+            let lastUserInteraction = 0;
+            let mapInitialized = false;
+            const MAP_INTERACTION_TIMEOUT = 60000; // 60 seconds
             
             function initMap() {
                 if (clientMap) return;
@@ -1403,6 +1406,14 @@ TEMPLATE = '''
                     layers: [darkTiles],
                     zoomControl: true,
                     attributionControl: true
+                });
+                
+                // Track user interactions
+                clientMap.on('zoomstart', function() {
+                    lastUserInteraction = Date.now();
+                });
+                clientMap.on('dragstart', function() {
+                    lastUserInteraction = Date.now();
                 });
                 
                 // Style attribution
@@ -1467,13 +1478,19 @@ TEMPLATE = '''
                     mapMarkers.push(marker);
                 });
                 
-                // Fit bounds with padding
-                if (bounds.length > 0) {
+                // Only auto-fit bounds if:
+                // 1. Map hasn't been initialized yet, OR
+                // 2. User hasn't interacted in the last 60 seconds
+                const timeSinceInteraction = Date.now() - lastUserInteraction;
+                const shouldAutoFit = !mapInitialized || timeSinceInteraction > MAP_INTERACTION_TIMEOUT;
+                
+                if (bounds.length > 0 && shouldAutoFit) {
                     if (bounds.length === 1) {
                         clientMap.setView(bounds[0], 10);
                     } else {
                         clientMap.fitBounds(bounds, { padding: [30, 30], maxZoom: 12 });
                     }
+                    mapInitialized = true;
                 }
             }
         </script>
