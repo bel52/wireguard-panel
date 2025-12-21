@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#
+# wg-tool — PiVPN-like WireGuard client management
+#
+# Usage:
+#   sudo wg-tool add <name> [endpoint]   Create client + add peer (no disconnect)
+#   sudo wg-tool qr <name>               Print QR code for client config
+#   sudo wg-tool list                    List all client configs and peers
+#   sudo wg-tool revoke <name>           Remove peer + delete client files
+#   sudo wg-tool show                    Show live WireGuard status
+#
+
+WG_DIR="/etc/wireguard"
+WG_CONF="${WG_DIR}/wg0.conf"
+CLIENT_DIR="${WG_DIR}/clients"
+SERVER_PUB="${WG_DIR}/server.pub"
+SERVER_PORT="51820"
+VPN_PREFIX="10.6.0"
+DNS_IP="10.6.0.1"
+WG_IFACE="wg0"
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "Run as root: sudo $0 $*"; exit 1; }; }
+
+pub_ip() {
+  curl -sS --max-time 3 https://api.ipify.org 2>/dev/null || true
+}
+
+next_ip() {
+  mkdir -p "$CLIENT_DIR"
+  local used
+  used="$(grep -Eo "${VPN_PREFIX}\.[0-9]{1,3}" "$WG_CONF" 2>/dev/null | sort -Vu || true)"
+  for i in $(seq 2 254); do
+    local ip="${VPN_PREFIX}.${i}"
+    if ! echo "$used" | grep -qx "$ip"; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_prereqs() {
+  mkdir -p "$CLIENT_DIR"
+  chmod 700 "$CLIENT_DIR"
+  command -v wg >/dev/null
+  command -v qrencode >/dev/null || apt-get -y install qrencode >/dev/null
+  [[ -f "$WG_CONF" ]] || { echo "Missing: $WG_CONF"; exit 1; }
+  [[ -f "$SERVER_PUB" ]] || { echo "Missing: $SERVER_PUB (server.pub)."; exit 1; }
+}
+
+# Apply config changes without restarting (no client disconnection)
+# Falls back to restart if interface is down
+apply_config() {
+  if ip link show "$WG_IFACE" &>/dev/null; then
+    # Interface is up — hot reload
+    wg syncconf "$WG_IFACE" <(wg-quick strip "$WG_CONF")
+    echo "(applied live via syncconf)"
+  else
+    # Interface is down — bring it up
+    systemctl start wg-quick@wg0
+    echo "(interface was down; started wg-quick@wg0)"
+  fi
+}
+
+cmd_add() {
+  need_root add "$@"
+  ensure_prereqs
+
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip]"; exit 1; }
+
+  local endpoint_host="${2:-}"
+  if [[ -z "$endpoint_host" ]]; then
+    endpoint_host="$(pub_ip)"
+    [[ -n "$endpoint_host" ]] || endpoint_host="YOUR_PUBLIC_IP_OR_DNS"
+  fi
+
+  local ip
+  ip="$(next_ip)" || { echo "No available IPs in ${VPN_PREFIX}.0/24"; exit 1; }
+
+  local key="${CLIENT_DIR}/${name}.key"
+  local pub="${CLIENT_DIR}/${name}.pub"
+  local conf="${CLIENT_DIR}/${name}.conf"
+
+  [[ ! -f "$conf" ]] || { echo "Client already exists: $conf"; exit 1; }
+
+  umask 077
+  wg genkey | tee "$key" | wg pubkey | tee "$pub" >/dev/null
+
+  local client_priv client_pub server_pub
+  client_priv="$(cat "$key")"
+  client_pub="$(cat "$pub")"
+  server_pub="$(cat "$SERVER_PUB")"
+
+  # Append peer (with trailing newline for clean formatting)
+  cat >> "$WG_CONF" <<EOP
+
+[Peer]
+# ${name}
+PublicKey = ${client_pub}
+AllowedIPs = ${ip}/32
+EOP
+
+  # Full tunnel (PiVPN-like)
+  cat > "$conf" <<EOC
+[Interface]
+PrivateKey = ${client_priv}
+Address = ${ip}/32
+DNS = ${DNS_IP}
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${endpoint_host}:${SERVER_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOC
+
+  chmod 600 "$conf"
+  apply_config
+
+  echo "OK: created ${conf}"
+  echo "Tip: wg-tool qr ${name}"
+}
+
+cmd_qr() {
+  need_root qr "$@"
+  ensure_prereqs
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: wg-tool qr <client_name>"; exit 1; }
+  local conf="${CLIENT_DIR}/${name}.conf"
+  [[ -f "$conf" ]] || { echo "Missing: $conf"; exit 1; }
+  qrencode -t ansiutf8 < "$conf"
+}
+
+cmd_show() {
+  need_root show "$@"
+  ensure_prereqs
+  echo "== wg show =="
+  wg show
+  echo
+  echo "== listening sockets (51820) =="
+  ss -lunp | grep -E ":(51820)\\b" || true
+}
+
+cmd_list() {
+  need_root list "$@"
+  ensure_prereqs
+  echo "== Clients (configs) =="
+  ls -1 "$CLIENT_DIR"/*.conf 2>/dev/null | sed "s|^| - |" || echo " (none yet)"
+  echo
+  echo "== Peers in wg0.conf =="
+  awk '
+    /^\[Peer\]/ {
+      # Print previous peer if we had one
+      if (inpeer) {
+        printf(" - %s | %s | %s\n", (name ? name : "(no-name)"), pub, ip)
+      }
+      inpeer = 1
+      name = ""
+      pub = ""
+      ip = ""
+      next
+    }
+    inpeer && /^# / {
+      name = $0
+      sub(/^# /, "", name)
+    }
+    inpeer && /^PublicKey *=/ {
+      pub = $0
+      sub(/^PublicKey *= */, "", pub)
+    }
+    inpeer && /^AllowedIPs *=/ {
+      ip = $0
+      sub(/^AllowedIPs *= */, "", ip)
+    }
+    END {
+      # Print final peer (fixes EOF-without-newline bug)
+      if (inpeer) {
+        printf(" - %s | %s | %s\n", (name ? name : "(no-name)"), pub, ip)
+      }
+    }
+  ' "$WG_CONF" || true
+}
+
+cmd_revoke() {
+  need_root revoke "$@"
+  ensure_prereqs
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: wg-tool revoke <client_name>"; exit 1; }
+
+  local conf="${CLIENT_DIR}/${name}.conf"
+  local pub="${CLIENT_DIR}/${name}.pub"
+
+  [[ -f "$pub" ]] || { echo "Missing pubkey file: $pub"; exit 1; }
+  local pk
+  pk="$(cat "$pub")"
+
+  # Remove peer block from wg0.conf matching this PublicKey
+  cp -a "$WG_CONF" "${WG_CONF}.bak_revoke_$(date +%Y%m%d_%H%M%S)"
+  awk -v pk="$pk" '
+    BEGIN { skip = 0; blk = "" }
+    /^\[Peer\]/ {
+      # Starting new peer block — flush previous if not skipping
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+      blk = $0 RS
+      skip = 0
+      next
+    }
+    /^\[Interface\]/ || /^\[/ {
+      # Another section (safety) — flush peer block first
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+      blk = ""
+      skip = 0
+      print
+      next
+    }
+    {
+      if (blk != "") {
+        blk = blk $0 RS
+        if ($0 ~ "^PublicKey *= *" pk "$") {
+          skip = 1
+        }
+      } else {
+        print
+      }
+    }
+    END {
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+    }
+  ' "$WG_CONF" > "${WG_CONF}.tmp"
+  mv "${WG_CONF}.tmp" "$WG_CONF"
+
+  # Remove client files
+  rm -f "${CLIENT_DIR}/${name}.conf" "${CLIENT_DIR}/${name}.key" "${CLIENT_DIR}/${name}.pub" 2>/dev/null || true
+
+  apply_config
+  echo "OK: revoked ${name}"
+}
+
+usage() {
+  cat <<USAGE
+Usage: sudo wg-tool <command> [args]
+
+Commands:
+  add <name> [endpoint]   Create client + add peer (no disconnect)
+  qr <name>               Print QR code for client config
+  list                    List clients + peers
+  revoke <name>           Remove peer + delete client files (no disconnect)
+  show                    Show wireguard status
+
+Notes:
+- Default endpoint is detected public IP; override with a DNS name if you have one.
+- DNS for clients is ${DNS_IP} (Pi-hole over VPN).
+- Changes are applied live via 'wg syncconf' — existing clients stay connected.
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    add) cmd_add "$@";;
+    qr) cmd_qr "$@";;
+    list) cmd_list;;
+    revoke) cmd_revoke "$@";;
+    show) cmd_show;;
+    ""|-h|--help|help) usage;;
+    *) echo "Unknown command: $cmd"; usage; exit 1;;
+  esac
+}
+
+main "$@"
