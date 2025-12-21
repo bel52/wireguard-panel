@@ -124,6 +124,13 @@ def init_db():
             total_sessions INTEGER DEFAULT 0
         );
 
+        -- Paused clients (internet blocked but VPN active)
+        CREATE TABLE IF NOT EXISTS paused_clients (
+            name TEXT PRIMARY KEY,
+            paused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            paused_by TEXT DEFAULT 'admin'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_client ON connection_history(client_name);
         CREATE INDEX IF NOT EXISTS idx_history_time ON connection_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_bandwidth_client ON bandwidth_samples(client_name);
@@ -517,6 +524,127 @@ def format_timestamp_friendly(iso_timestamp):
         return str(iso_timestamp)[:19].replace('T', ' ')
 
 
+# --------------- Client Pause Functions ---------------
+
+def get_client_ip(client_name):
+    """Get the VPN IP address for a client."""
+    output, _ = run_cmd(['wg-tool', 'list'])
+    for line in output.split('\n'):
+        if line.strip().startswith('- ') and client_name in line:
+            parts = line[2:].split('|')
+            if len(parts) >= 3 and parts[0].strip() == client_name:
+                return parts[2].strip().replace('/32', '')
+    return None
+
+def is_client_paused(client_name):
+    """Check if a client is paused."""
+    try:
+        conn = get_db()
+        row = conn.execute('SELECT 1 FROM paused_clients WHERE name = ?', (client_name,)).fetchone()
+        conn.close()
+        return row is not None
+    except:
+        return False
+
+def get_paused_clients():
+    """Get list of all paused clients."""
+    try:
+        conn = get_db()
+        rows = conn.execute('SELECT name, paused_at FROM paused_clients').fetchall()
+        conn.close()
+        return {row['name']: row['paused_at'] for row in rows}
+    except:
+        return {}
+
+def pause_client(client_name):
+    """Pause a client - block their internet traffic via iptables."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', client_name):
+        return False, "Invalid client name"
+
+    # Check if already paused
+    if is_client_paused(client_name):
+        return False, "Client is already paused"
+
+    # Get client's VPN IP
+    client_ip = get_client_ip(client_name)
+    if not client_ip:
+        return False, "Could not find client IP"
+
+    # Add iptables rules to block traffic
+    # Block outgoing traffic from client
+    out_result, out_code = run_cmd(['iptables', '-I', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+    # Block incoming traffic to client
+    in_result, in_code = run_cmd(['iptables', '-I', 'FORWARD', '-d', client_ip, '-j', 'DROP'])
+
+    if out_code != 0 or in_code != 0:
+        # Try to clean up if partial failure
+        run_cmd(['iptables', '-D', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+        run_cmd(['iptables', '-D', 'FORWARD', '-d', client_ip, '-j', 'DROP'])
+        return False, f"Failed to add iptables rules: {out_result} {in_result}"
+
+    # Record in database
+    try:
+        conn = get_db()
+        conn.execute('INSERT OR REPLACE INTO paused_clients (name) VALUES (?)', (client_name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        # Rollback iptables changes
+        run_cmd(['iptables', '-D', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+        run_cmd(['iptables', '-D', 'FORWARD', '-d', client_ip, '-j', 'DROP'])
+        return False, f"Database error: {str(e)}"
+
+    # Log the event
+    log_connection_event(client_name, 'paused', client_ip)
+    return True, "Client paused successfully"
+
+def unpause_client(client_name):
+    """Unpause a client - restore their internet traffic."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', client_name):
+        return False, "Invalid client name"
+
+    # Check if actually paused
+    if not is_client_paused(client_name):
+        return False, "Client is not paused"
+
+    # Get client's VPN IP
+    client_ip = get_client_ip(client_name)
+    if not client_ip:
+        return False, "Could not find client IP"
+
+    # Remove iptables rules
+    run_cmd(['iptables', '-D', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+    run_cmd(['iptables', '-D', 'FORWARD', '-d', client_ip, '-j', 'DROP'])
+
+    # Remove from database
+    try:
+        conn = get_db()
+        conn.execute('DELETE FROM paused_clients WHERE name = ?', (client_name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return False, f"Database error: {str(e)}"
+
+    # Log the event
+    log_connection_event(client_name, 'unpaused', client_ip)
+    return True, "Client unpaused successfully"
+
+def restore_paused_clients_iptables():
+    """Restore iptables rules for paused clients on startup."""
+    paused = get_paused_clients()
+    restored = 0
+    for client_name in paused:
+        client_ip = get_client_ip(client_name)
+        if client_ip:
+            # Check if rule already exists to avoid duplicates
+            check_out, _ = run_cmd(['iptables', '-C', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+            if 'No chain/target/match' in check_out or 'does a matching rule exist' in check_out.lower():
+                run_cmd(['iptables', '-I', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
+                run_cmd(['iptables', '-I', 'FORWARD', '-d', client_ip, '-j', 'DROP'])
+                restored += 1
+    return restored
+
+
 # --------------- WireGuard Functions ---------------
 
 def parse_handshake_to_seconds(hs_string):
@@ -582,15 +710,16 @@ def parse_wg_show():
 
 def get_clients():
     global BANDWIDTH_CACHE
-    
+
     output, _ = run_cmd(['wg-tool', 'list'])
-    
+
     clients = []
     peers_live = {p['public_key']: p for p in parse_wg_show()}
-    
+    paused_clients = get_paused_clients()  # Get all paused clients
+
     conn = get_db()
     now = datetime.now()
-    
+
     # Cleanup old bandwidth samples periodically
     cleanup_old_samples()
     
@@ -716,6 +845,7 @@ def get_clients():
                     'public_key': pubkey,
                     'ip': ip,
                     'connected': is_connected,
+                    'paused': name in paused_clients,
                     'connection_duration': connection_duration,
                     'connection_duration_fmt': format_duration(connection_duration) if connection_duration else None,
                     'endpoint': endpoint if is_connected else '',
@@ -1125,6 +1255,23 @@ TEMPLATE = '''
             background: var(--bg-secondary);
             padding: 3px 8px;
             border-radius: 6px;
+        }
+        .client-info h3 .paused-badge {
+            font-size: 0.7em;
+            font-weight: 600;
+            color: #fff;
+            background: var(--danger);
+            padding: 3px 10px;
+            border-radius: 6px;
+            animation: pulse-paused 2s infinite;
+        }
+        @keyframes pulse-paused {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .client-card.paused {
+            border-left: 3px solid var(--danger);
+            opacity: 0.85;
         }
         .live-speed {
             font-size: 0.8em;
@@ -1713,6 +1860,8 @@ TEMPLATE = '''
         .activity-icon.disconnected { background: rgba(243,156,18,0.15); }
         .activity-icon.created { background: rgba(52,152,219,0.15); }
         .activity-icon.revoked { background: rgba(231,76,60,0.15); }
+        .activity-icon.paused { background: rgba(231,76,60,0.15); }
+        .activity-icon.unpaused { background: rgba(0,212,170,0.15); }
         .activity-content {
             min-width: 0;
         }
@@ -2123,7 +2272,9 @@ TEMPLATE = '''
                     'connected': '🟢',
                     'disconnected': '🟡',
                     'created': '✨',
-                    'revoked': '🗑️'
+                    'revoked': '🗑️',
+                    'paused': '⏸️',
+                    'unpaused': '▶️'
                 };
                 return icons[eventType] || '📋';
             }
@@ -2133,7 +2284,9 @@ TEMPLATE = '''
                     'connected': 'connected',
                     'disconnected': 'disconnected',
                     'created': 'was created',
-                    'revoked': 'was revoked'
+                    'revoked': 'was revoked',
+                    'paused': 'was paused',
+                    'unpaused': 'was unpaused'
                 };
                 return verbs[eventType] || eventType;
             }
@@ -2174,6 +2327,43 @@ TEMPLATE = '''
                             `;
                         }).join('');
                     });
+            }
+
+            // ===== Pause/Unpause =====
+            function pauseClient(name) {
+                if (!confirm(`Pause internet for "${name}"? They will stay connected to VPN but cannot access the internet.`)) return;
+
+                fetch('/api/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok) {
+                        refreshDashboard();
+                    } else {
+                        alert('Failed to pause: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => alert('Error: ' + err));
+            }
+
+            function unpauseClient(name) {
+                fetch('/api/unpause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok) {
+                        refreshDashboard();
+                    } else {
+                        alert('Failed to unpause: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => alert('Error: ' + err));
             }
 
             // ===== Modals =====
@@ -2397,7 +2587,7 @@ TEMPLATE = '''
                     const handshakeStale = c.handshake_seconds && c.handshake_seconds > 120;
 
                     return `
-                    <div class="client-card" data-name="${c.name}" data-connected="${c.connected}">
+                    <div class="client-card ${c.paused ? 'paused' : ''}" data-name="${c.name}" data-connected="${c.connected}" data-paused="${c.paused}">
                         <div class="status-indicator">
                             <div class="status-dot ${c.connected ? 'connected' : ''}"
                                  title="${c.connected ? 'Connected' : 'Offline'}"></div>
@@ -2405,6 +2595,7 @@ TEMPLATE = '''
                         <div class="client-info">
                             <h3>
                                 ${c.name}
+                                ${c.paused ? '<span class="paused-badge">⏸ PAUSED</span>' : ''}
                                 ${c.note ? `<span class="note-badge">${c.note}</span>` : ''}
                                 ${handshakeDisplay ? `<span class="handshake-badge ${handshakeStale ? 'stale' : ''}">${handshakeDisplay}</span>` : ''}
                             </h3>
@@ -2425,6 +2616,10 @@ TEMPLATE = '''
                             ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen ${c.last_seen_friendly || formatTimeAgo(c.last_seen)}${displayLastEndpoint ? ' from ' + displayLastEndpoint : ''}</div>` : ''}
                         </div>
                         <div class="client-actions">
+                            ${c.paused
+                                ? `<button class="icon-btn" onclick="unpauseClient('${c.name}')" title="Resume Internet">▶️</button>`
+                                : `<button class="icon-btn" onclick="pauseClient('${c.name}')" title="Pause Internet">⏸️</button>`
+                            }
                             <button class="icon-btn" onclick="showQR('${c.name}')" title="QR Code">📱</button>
                             <button class="icon-btn" onclick="showConfig('${c.name}')" title="Config">📄</button>
                             <a href="/download/${c.name}" class="icon-btn" title="Download">⬇️</a>
@@ -2698,6 +2893,28 @@ def api_note():
         return jsonify({'ok': True})
     return jsonify({'error': 'invalid'}), 400
 
+@app.route('/api/pause', methods=['POST'])
+@login_required
+def api_pause():
+    data = request.get_json()
+    if data and 'name' in data:
+        success, msg = pause_client(data['name'])
+        if success:
+            return jsonify({'ok': True, 'message': msg})
+        return jsonify({'ok': False, 'error': msg}), 400
+    return jsonify({'error': 'invalid request'}), 400
+
+@app.route('/api/unpause', methods=['POST'])
+@login_required
+def api_unpause():
+    data = request.get_json()
+    if data and 'name' in data:
+        success, msg = unpause_client(data['name'])
+        if success:
+            return jsonify({'ok': True, 'message': msg})
+        return jsonify({'ok': False, 'error': msg}), 400
+    return jsonify({'error': 'invalid request'}), 400
+
 @app.route('/add', methods=['POST'])
 @login_required
 def add():
@@ -2755,6 +2972,11 @@ if __name__ == '__main__':
     load_traffic_from_db()
     cleanup_old_traffic_samples()
     print(f"Loaded {len(TRAFFIC_RING_BUFFER)} traffic samples from database")
+
+    # Restore iptables rules for paused clients
+    restored = restore_paused_clients_iptables()
+    if restored > 0:
+        print(f"Restored iptables rules for {restored} paused client(s)")
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     print(f"LeathGuard v4 starting on port {port}")
