@@ -27,12 +27,14 @@ A lightweight, self-hosted WireGuard VPN management solution with both CLI and w
 
 ### v4 New Features
 - **Health & Risk Monitoring** — system health card showing WireGuard interface, IP forwarding, and NAT status
-- **Rolling Traffic Stats** — 1h/24h traffic windows with totals preserved
+- **Persistent Traffic Stats** — 1h/24h traffic windows survive restarts (stored in SQLite)
+- **Daily Usage Tracking** — per-client daily usage stats for historical reporting
 - **Demo-safe Mode** — one-click redaction of all sensitive IPs and locations for presentations
 - **Collapsible Map** — map collapsed by default, state persists in localStorage
 - **Enhanced Client Controls** — search, filter (All/Connected/Offline/Last 24h), and sort (Name/Handshake/RX/TX)
 - **Compact Actions** — icon buttons with tooltips, copy-to-clipboard for endpoints
-- **Activity Strip** — recent events displayed prominently on dashboard
+- **Recent Activity Section** — improved vertical layout with icons and friendly timestamps (below map)
+- **Friendly Timestamps** — "Last seen 5m ago" instead of raw ISO dates
 - **Last Handshake Badge** — prominent handshake indicator per client
 
 ## Requirements
