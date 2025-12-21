@@ -70,7 +70,7 @@ def init_db():
             note TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS connection_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT,
@@ -78,7 +78,7 @@ def init_db():
             endpoint TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS bandwidth_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT,
@@ -86,7 +86,7 @@ def init_db():
             tx_delta INTEGER,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS client_sessions (
             name TEXT PRIMARY KEY,
             session_start TIMESTAMP,
@@ -94,11 +94,43 @@ def init_db():
             last_endpoint TEXT,
             is_connected INTEGER DEFAULT 0
         );
-        
+
+        -- Persistent traffic samples for 1h/24h stats (survives restarts)
+        CREATE TABLE IF NOT EXISTS traffic_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rx_delta INTEGER DEFAULT 0,
+            tx_delta INTEGER DEFAULT 0,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Daily client usage for historical reporting
+        CREATE TABLE IF NOT EXISTS daily_client_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            date TEXT,
+            rx_bytes INTEGER DEFAULT 0,
+            tx_bytes INTEGER DEFAULT 0,
+            connection_seconds INTEGER DEFAULT 0,
+            session_count INTEGER DEFAULT 0,
+            UNIQUE(client_name, date)
+        );
+
+        -- Daily server totals for historical reporting
+        CREATE TABLE IF NOT EXISTS daily_server_stats (
+            date TEXT PRIMARY KEY,
+            total_rx INTEGER DEFAULT 0,
+            total_tx INTEGER DEFAULT 0,
+            peak_connections INTEGER DEFAULT 0,
+            total_sessions INTEGER DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_client ON connection_history(client_name);
         CREATE INDEX IF NOT EXISTS idx_history_time ON connection_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_bandwidth_client ON bandwidth_samples(client_name);
         CREATE INDEX IF NOT EXISTS idx_bandwidth_time ON bandwidth_samples(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_traffic_time ON traffic_samples(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_daily_usage_client ON daily_client_usage(client_name);
+        CREATE INDEX IF NOT EXISTS idx_daily_usage_date ON daily_client_usage(date);
     ''')
     conn.commit()
     conn.close()
@@ -320,10 +352,10 @@ def get_health_status():
     }
 
 
-# --------------- Traffic Ring Buffer Functions ---------------
+# --------------- Traffic & Usage Functions (Persistent) ---------------
 
 def record_traffic_sample(total_rx, total_tx):
-    """Record a traffic sample to the ring buffer for 1h/24h stats."""
+    """Record a traffic sample to both memory buffer and database for persistence."""
     global LAST_TRAFFIC_SAMPLE
 
     now = time.time()
@@ -334,17 +366,64 @@ def record_traffic_sample(total_rx, total_tx):
             rx_delta = max(0, total_rx - LAST_TRAFFIC_SAMPLE['rx'])
             tx_delta = max(0, total_tx - LAST_TRAFFIC_SAMPLE['tx'])
 
-            # Only record if there's actual traffic or it's been a while
+            # Add to memory buffer for fast access
             TRAFFIC_RING_BUFFER.append({
                 'timestamp': now,
                 'rx': rx_delta,
                 'tx': tx_delta
             })
 
+            # Persist to database (for survival across restarts)
+            if rx_delta > 0 or tx_delta > 0:
+                try:
+                    conn = get_db()
+                    conn.execute('''
+                        INSERT INTO traffic_samples (rx_delta, tx_delta)
+                        VALUES (?, ?)
+                    ''', (rx_delta, tx_delta))
+                    conn.commit()
+                    conn.close()
+                except:
+                    pass
+
         LAST_TRAFFIC_SAMPLE = {'rx': total_rx, 'tx': total_tx, 'time': now}
 
+def load_traffic_from_db():
+    """Load traffic samples from database into memory buffer on startup."""
+    global TRAFFIC_RING_BUFFER
+    try:
+        conn = get_db()
+        # Load samples from last 24 hours
+        rows = conn.execute('''
+            SELECT rx_delta, tx_delta, strftime('%s', timestamp) as ts
+            FROM traffic_samples
+            WHERE timestamp > datetime('now', '-24 hours')
+            ORDER BY timestamp ASC
+        ''').fetchall()
+        conn.close()
+
+        with TRAFFIC_BUFFER_LOCK:
+            for row in rows:
+                TRAFFIC_RING_BUFFER.append({
+                    'timestamp': float(row['ts']),
+                    'rx': row['rx_delta'],
+                    'tx': row['tx_delta']
+                })
+    except:
+        pass
+
+def cleanup_old_traffic_samples():
+    """Remove traffic samples older than 24 hours from database."""
+    try:
+        conn = get_db()
+        conn.execute("DELETE FROM traffic_samples WHERE timestamp < datetime('now', '-24 hours')")
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
 def get_traffic_windows():
-    """Calculate traffic for last 1h and 24h windows."""
+    """Calculate traffic for last 1h and 24h windows from memory buffer."""
     now = time.time()
     hour_ago = now - 3600
     day_ago = now - 86400
@@ -368,6 +447,74 @@ def get_traffic_windows():
         'last1h': {'rxBytes': rx_1h, 'txBytes': tx_1h},
         'last24h': {'rxBytes': rx_24h, 'txBytes': tx_24h}
     }
+
+def update_daily_client_usage(client_name, rx_delta, tx_delta, connection_seconds=0, new_session=False):
+    """Update daily usage stats for a client."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        conn = get_db()
+        conn.execute('''
+            INSERT INTO daily_client_usage (client_name, date, rx_bytes, tx_bytes, connection_seconds, session_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_name, date) DO UPDATE SET
+                rx_bytes = rx_bytes + excluded.rx_bytes,
+                tx_bytes = tx_bytes + excluded.tx_bytes,
+                connection_seconds = connection_seconds + excluded.connection_seconds,
+                session_count = session_count + excluded.session_count
+        ''', (client_name, today, rx_delta, tx_delta, connection_seconds, 1 if new_session else 0))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def get_client_today_usage(client_name):
+    """Get today's usage for a specific client."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        conn = get_db()
+        row = conn.execute('''
+            SELECT rx_bytes, tx_bytes, connection_seconds, session_count
+            FROM daily_client_usage
+            WHERE client_name = ? AND date = ?
+        ''', (client_name, today)).fetchone()
+        conn.close()
+        if row:
+            return {
+                'rx_bytes': row['rx_bytes'],
+                'tx_bytes': row['tx_bytes'],
+                'connection_seconds': row['connection_seconds'],
+                'session_count': row['session_count']
+            }
+    except:
+        pass
+    return {'rx_bytes': 0, 'tx_bytes': 0, 'connection_seconds': 0, 'session_count': 0}
+
+def format_timestamp_friendly(iso_timestamp):
+    """Format ISO timestamp to user-friendly format."""
+    if not iso_timestamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_timestamp).replace('Z', '+00:00'))
+        now = datetime.now()
+        diff = now - dt
+
+        if diff.days == 0:
+            if diff.seconds < 60:
+                return "just now"
+            elif diff.seconds < 3600:
+                mins = diff.seconds // 60
+                return f"{mins}m ago"
+            else:
+                hours = diff.seconds // 3600
+                return f"{hours}h ago"
+        elif diff.days == 1:
+            return f"yesterday at {dt.strftime('%I:%M %p')}"
+        elif diff.days < 7:
+            return f"{diff.days} days ago"
+        else:
+            return dt.strftime('%b %d at %I:%M %p')
+    except:
+        return str(iso_timestamp)[:19].replace('T', ' ')
 
 
 # --------------- WireGuard Functions ---------------
@@ -542,6 +689,8 @@ def get_clients():
                         VALUES (?, ?, ?)
                     ''', (name, rx_delta, tx_delta))
                     conn.commit()
+                    # Update daily client usage for historical reporting
+                    update_daily_client_usage(name, rx_delta, tx_delta)
                 
                 # Get recent bandwidth samples (last 60 seconds = ~12 samples at 5s intervals)
                 bw_rows = conn.execute('''
@@ -555,7 +704,13 @@ def get_clients():
                 geo = get_geoip(endpoint) if endpoint else None
                 if not geo and last_endpoint:
                     geo = get_geoip(last_endpoint)
-                
+
+                # Get today's usage for this client
+                today_usage = get_client_today_usage(name)
+
+                # Format last_seen in a friendly way
+                last_seen_friendly = format_timestamp_friendly(last_seen) if last_seen else None
+
                 clients.append({
                     'name': name,
                     'public_key': pubkey,
@@ -572,9 +727,14 @@ def get_clients():
                     'transfer_tx_fmt': format_bytes(current_tx),
                     'note': note,
                     'last_seen': last_seen,
+                    'last_seen_friendly': last_seen_friendly,
                     'last_endpoint': last_endpoint,
                     'geo': geo,
-                    'bandwidth_history': bandwidth_history
+                    'bandwidth_history': bandwidth_history,
+                    'today_rx': today_usage['rx_bytes'],
+                    'today_tx': today_usage['tx_bytes'],
+                    'today_rx_fmt': format_bytes(today_usage['rx_bytes']),
+                    'today_tx_fmt': format_bytes(today_usage['tx_bytes'])
                 })
     
     conn.close()
@@ -1494,44 +1654,85 @@ TEMPLATE = '''
             margin-top: 4px;
         }
 
-        /* Activity Strip */
-        .activity-strip {
+        /* Recent Activity Section */
+        .activity-section {
             background: var(--bg-secondary);
-            padding: 12px 16px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 20px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.15);
         }
-        .activity-strip-title {
+        .activity-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--bg-tertiary);
+        }
+        .activity-title {
+            font-size: 1em;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .activity-count {
             font-size: 0.8em;
             color: var(--text-secondary);
-            margin-bottom: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
         }
-        .activity-items {
+        .activity-list {
             display: flex;
-            gap: 12px;
-            overflow-x: auto;
-            padding-bottom: 4px;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 300px;
+            overflow-y: auto;
         }
-        .activity-item {
-            flex-shrink: 0;
-            font-size: 0.8em;
-            padding: 6px 10px;
+        .activity-row {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 12px;
+            align-items: center;
+            padding: 10px 12px;
             background: var(--bg-tertiary);
-            border-radius: 6px;
+            border-radius: 8px;
+            font-size: 0.85em;
+            transition: background 0.2s;
+        }
+        .activity-row:hover {
+            background: var(--bg-primary);
+        }
+        .activity-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
             display: flex;
             align-items: center;
-            gap: 6px;
+            justify-content: center;
+            font-size: 0.9em;
         }
-        .activity-item .time {
+        .activity-icon.connected { background: rgba(0,212,170,0.15); }
+        .activity-icon.disconnected { background: rgba(243,156,18,0.15); }
+        .activity-icon.created { background: rgba(52,152,219,0.15); }
+        .activity-icon.revoked { background: rgba(231,76,60,0.15); }
+        .activity-content {
+            min-width: 0;
+        }
+        .activity-client {
+            font-weight: 500;
+            color: var(--accent);
+        }
+        .activity-event {
+            color: var(--text-primary);
+        }
+        .activity-endpoint {
+            font-size: 0.85em;
             color: var(--text-secondary);
+            margin-top: 2px;
         }
-        .activity-item.created { border-left: 3px solid var(--accent); }
-        .activity-item.revoked { border-left: 3px solid var(--danger); }
-        .activity-item.connected { border-left: 3px solid var(--success); }
-        .activity-item.disconnected { border-left: 3px solid var(--warning); }
+        .activity-time {
+            font-size: 0.8em;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
 
         /* Subtitle */
         .header-subtitle {
@@ -1620,14 +1821,6 @@ TEMPLATE = '''
                 <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
             </div>
 
-            <!-- Activity Strip -->
-            <div class="activity-strip" id="activityStrip">
-                <div class="activity-strip-title">Recent Activity</div>
-                <div class="activity-items" id="activityItems">
-                    <div class="activity-item">Loading...</div>
-                </div>
-            </div>
-
             <div class="card">
                 <!-- Client Controls: Search, Filter, Sort -->
                 <div class="client-controls">
@@ -1665,8 +1858,19 @@ TEMPLATE = '''
                     <div id="client-map"></div>
                 </div>
             </div>
+
+            <!-- Recent Activity Section -->
+            <div class="activity-section" id="activitySection">
+                <div class="activity-header">
+                    <span class="activity-title">Recent Activity</span>
+                    <span class="activity-count" id="activityCount"></span>
+                </div>
+                <div class="activity-list" id="activityList">
+                    <div class="activity-row">Loading activity...</div>
+                </div>
+            </div>
         </div>
-        
+
         <!-- Modals -->
         <div class="modal" id="addModal">
             <div class="modal-content">
@@ -1895,25 +2099,77 @@ TEMPLATE = '''
                     });
             }
 
-            // ===== Activity Strip =====
-            function updateActivityStrip() {
+            // ===== Activity Section =====
+            function formatTimeAgo(timestamp) {
+                if (!timestamp) return '';
+                const date = new Date(timestamp.replace(' ', 'T'));
+                const now = new Date();
+                const diffMs = now - date;
+                const diffSec = Math.floor(diffMs / 1000);
+                const diffMin = Math.floor(diffSec / 60);
+                const diffHour = Math.floor(diffMin / 60);
+                const diffDay = Math.floor(diffHour / 24);
+
+                if (diffSec < 60) return 'just now';
+                if (diffMin < 60) return `${diffMin}m ago`;
+                if (diffHour < 24) return `${diffHour}h ago`;
+                if (diffDay === 1) return 'yesterday';
+                if (diffDay < 7) return `${diffDay}d ago`;
+                return date.toLocaleDateString();
+            }
+
+            function getActivityIcon(eventType) {
+                const icons = {
+                    'connected': '🟢',
+                    'disconnected': '🟡',
+                    'created': '✨',
+                    'revoked': '🗑️'
+                };
+                return icons[eventType] || '📋';
+            }
+
+            function getActivityVerb(eventType) {
+                const verbs = {
+                    'connected': 'connected',
+                    'disconnected': 'disconnected',
+                    'created': 'was created',
+                    'revoked': 'was revoked'
+                };
+                return verbs[eventType] || eventType;
+            }
+
+            function updateActivitySection() {
                 fetch('/api/history')
                     .then(r => r.json())
                     .then(data => {
-                        const items = document.getElementById('activityItems');
+                        const list = document.getElementById('activityList');
+                        const count = document.getElementById('activityCount');
+
                         if (data.length === 0) {
-                            items.innerHTML = '<div class="activity-item">No recent activity</div>';
+                            list.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">No recent activity</div>';
+                            count.textContent = '';
                             return;
                         }
-                        // Show last 10 events
-                        items.innerHTML = data.slice(0, 10).map(h => {
-                            const time = h.timestamp.split(' ')[1] || h.timestamp;
+
+                        count.textContent = `${data.length} events`;
+
+                        // Show last 15 events
+                        list.innerHTML = data.slice(0, 15).map(h => {
                             const endpoint = demoMode ? redactIP(h.endpoint) : h.endpoint;
+                            const timeAgo = formatTimeAgo(h.timestamp);
                             return `
-                                <div class="activity-item ${h.event_type}">
-                                    <span class="time">${time}</span>
-                                    <span>${h.client_name}: ${h.event_type}</span>
-                                    ${endpoint ? `<span style="opacity:0.6"> ${endpoint}</span>` : ''}
+                                <div class="activity-row">
+                                    <div class="activity-icon ${h.event_type}">
+                                        ${getActivityIcon(h.event_type)}
+                                    </div>
+                                    <div class="activity-content">
+                                        <div>
+                                            <span class="activity-client">${h.client_name}</span>
+                                            <span class="activity-event">${getActivityVerb(h.event_type)}</span>
+                                        </div>
+                                        ${endpoint ? `<div class="activity-endpoint">from ${endpoint}</div>` : ''}
+                                    </div>
+                                    <div class="activity-time">${timeAgo}</div>
                                 </div>
                             `;
                         }).join('');
@@ -2166,7 +2422,7 @@ TEMPLATE = '''
                                 <span class="tx-speed">↑${txSpeed}</span>
                             </div>
                             ` : ''}
-                            ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen: ${c.last_seen}${displayLastEndpoint ? ' from ' + displayLastEndpoint : ''}</div>` : ''}
+                            ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen ${c.last_seen_friendly || formatTimeAgo(c.last_seen)}${displayLastEndpoint ? ' from ' + displayLastEndpoint : ''}</div>` : ''}
                         </div>
                         <div class="client-actions">
                             <button class="icon-btn" onclick="showQR('${c.name}')" title="QR Code">📱</button>
@@ -2371,7 +2627,7 @@ TEMPLATE = '''
             try {
                 refreshDashboard();
                 fetchHealth();
-                updateActivityStrip();
+                updateActivitySection();
             } catch (e) {
                 console.error('Initial load error:', e);
             }
@@ -2384,7 +2640,7 @@ TEMPLATE = '''
                 try { fetchHealth(); } catch (e) { console.error('Health error:', e); }
             }, 30000);
             setInterval(() => {
-                try { updateActivityStrip(); } catch (e) { console.error('Activity error:', e); }
+                try { updateActivitySection(); } catch (e) { console.error('Activity error:', e); }
             }, 15000);
         </script>
         {% endif %}
@@ -2494,6 +2750,12 @@ if __name__ == '__main__':
     import sys
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
+
+    # Load persistent traffic stats from database
+    load_traffic_from_db()
+    cleanup_old_traffic_samples()
+    print(f"Loaded {len(TRAFFIC_RING_BUFFER)} traffic samples from database")
+
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     print(f"LeathGuard v4 starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
