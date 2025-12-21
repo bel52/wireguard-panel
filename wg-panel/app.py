@@ -714,7 +714,7 @@ TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WireGuard Panel</title>
+    <title>LeathGuard</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
     <style>
@@ -1560,7 +1560,7 @@ TEMPLATE = '''
         <!-- Login -->
         <div class="login-container">
             <div class="card">
-                <h1>WireGuard Panel</h1>
+                <h1>LeathGuard</h1>
                 {% for msg in get_flashed_messages() %}
                 <div class="flash error">{{ msg }}</div>
                 {% endfor %}
@@ -1581,8 +1581,8 @@ TEMPLATE = '''
         <!-- Dashboard -->
         <div class="header">
             <div>
-                <h1>WireGuard Panel</h1>
-                <div class="header-subtitle">WireGuard • Clients • Traffic • Activity</div>
+                <h1>LeathGuard</h1>
+                <div class="header-subtitle">VPN • Clients • Traffic • Activity</div>
             </div>
             <div class="header-actions">
                 <span class="demo-pill" id="demoPill">Demo Mode</span>
