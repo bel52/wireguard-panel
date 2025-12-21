@@ -180,7 +180,7 @@ def get_geoip(ip):
     
     try:
         import urllib.request
-        url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp"
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,lat,lon"
         with urllib.request.urlopen(url, timeout=2) as resp:
             data = json.loads(resp.read().decode())
             if data.get('status') == 'success':
@@ -189,6 +189,8 @@ def get_geoip(ip):
                     'country_code': data.get('countryCode', '').lower(),
                     'city': data.get('city', ''),
                     'isp': data.get('isp', ''),
+                    'lat': data.get('lat'),
+                    'lon': data.get('lon'),
                     '_time': time.time()
                 }
                 GEOIP_CACHE[ip] = result
@@ -544,6 +546,8 @@ TEMPLATE = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WireGuard Panel</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
     <style>
         :root {
             --bg-primary: #1a1a2e;
@@ -574,34 +578,41 @@ TEMPLATE = '''
             background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
-            padding: 15px;
+            padding: 24px;
             transition: background 0.3s, color 0.3s;
         }
         
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1100px; margin: 0 auto; }
         
         h1 { 
             color: var(--accent); 
-            margin-bottom: 20px;
             display: flex;
             align-items: center;
-            gap: 10px;
-            font-size: 1.5em;
+            gap: 12px;
+            font-size: 1.6em;
+            font-weight: 600;
+            letter-spacing: -0.5px;
         }
-        h1::before { content: "◈"; }
+        h1::before { 
+            content: "◈"; 
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
         
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            margin-bottom: 28px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--bg-tertiary);
             flex-wrap: wrap;
-            gap: 10px;
+            gap: 16px;
         }
         
         .header-actions {
             display: flex;
-            gap: 8px;
+            gap: 10px;
             align-items: center;
             flex-wrap: wrap;
         }
@@ -610,66 +621,134 @@ TEMPLATE = '''
             background: var(--accent);
             color: var(--bg-primary);
             border: none;
-            padding: 8px 16px;
-            border-radius: 5px;
+            padding: 10px 18px;
+            border-radius: 8px;
             cursor: pointer;
             font-weight: 600;
             text-decoration: none;
             display: inline-flex;
             align-items: center;
-            gap: 5px;
+            gap: 6px;
             font-size: 0.9em;
-            transition: background 0.2s;
+            transition: all 0.2s ease;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        .btn:hover { background: var(--accent-hover); }
+        .btn:hover { 
+            background: var(--accent-hover); 
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
         .btn-danger { background: var(--danger); color: white; }
         .btn-danger:hover { background: var(--danger-hover); }
-        .btn-secondary { background: #4a4a6a; color: white; }
-        .btn-secondary:hover { background: #5a5a7a; }
-        .btn-small { padding: 5px 10px; font-size: 0.8em; }
+        .btn-secondary { 
+            background: var(--bg-tertiary); 
+            color: var(--text-primary);
+            box-shadow: none;
+        }
+        .btn-secondary:hover { 
+            background: #3d3d5c; 
+            transform: translateY(-1px);
+        }
+        .btn-small { padding: 6px 12px; font-size: 0.8em; }
         
         .card {
             background: var(--bg-secondary);
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+            border: 1px solid rgba(255,255,255,0.05);
         }
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-            gap: 10px;
-            margin-bottom: 15px;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
         }
         
         .stat-box {
-            background: var(--bg-tertiary);
-            padding: 12px;
-            border-radius: 8px;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            padding: 20px 16px;
+            border-radius: 14px;
             text-align: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .stat-box:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
         }
         .stat-box .number { 
-            font-size: 1.4em; 
+            font-size: 1.6em; 
             color: var(--accent); 
-            font-weight: bold; 
+            font-weight: 700;
+            letter-spacing: -0.5px;
         }
         .stat-box .label { 
             color: var(--text-secondary); 
             font-size: 0.75em; 
-            margin-top: 2px;
+            margin-top: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
         }
         .stat-box.warning .number { color: var(--warning); }
         
-        .client-grid { display: grid; gap: 10px; }
+        .client-grid { display: grid; gap: 16px; }
+        
+        .map-container {
+            height: 300px;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        #client-map {
+            height: 100%;
+            width: 100%;
+            background: var(--bg-tertiary);
+        }
+        .leaflet-popup-content-wrapper {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
+        .leaflet-popup-tip {
+            background: var(--bg-secondary);
+        }
+        .leaflet-popup-content {
+            margin: 10px 12px;
+            font-size: 0.9em;
+        }
+        .map-popup-title {
+            font-weight: 600;
+            color: var(--accent);
+            margin-bottom: 4px;
+        }
+        .map-popup-info {
+            color: var(--text-secondary);
+            font-size: 0.85em;
+        }
         
         .client-card {
             background: var(--bg-tertiary);
-            border-radius: 8px;
-            padding: 12px;
+            border-radius: 12px;
+            padding: 18px;
             display: grid;
             grid-template-columns: auto 1fr auto;
-            gap: 12px;
+            gap: 16px;
             align-items: start;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            border: 1px solid rgba(255,255,255,0.03);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .client-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.25);
         }
         
         .status-indicator {
@@ -677,19 +756,20 @@ TEMPLATE = '''
             flex-direction: column;
             align-items: center;
             gap: 4px;
-            padding-top: 3px;
+            padding-top: 4px;
         }
         
         .status-dot {
-            width: 12px;
-            height: 12px;
+            width: 14px;
+            height: 14px;
             border-radius: 50%;
-            background: #555;
+            background: #444;
             transition: all 0.3s;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
         }
         .status-dot.connected { 
             background: var(--success); 
-            box-shadow: 0 0 10px var(--success);
+            box-shadow: 0 0 12px var(--success), inset 0 1px 3px rgba(255,255,255,0.3);
             animation: pulse 2s infinite;
         }
         
@@ -700,45 +780,48 @@ TEMPLATE = '''
         
         .client-info { min-width: 0; }
         .client-info h3 { 
-            margin-bottom: 4px; 
+            margin-bottom: 6px; 
             color: var(--text-primary);
-            font-size: 1em;
+            font-size: 1.1em;
+            font-weight: 600;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
             flex-wrap: wrap;
         }
         .client-info h3 .note-badge {
-            font-size: 0.75em;
-            font-weight: normal;
+            font-size: 0.7em;
+            font-weight: 500;
             color: var(--text-secondary);
             background: var(--bg-secondary);
-            padding: 2px 6px;
-            border-radius: 4px;
+            padding: 3px 8px;
+            border-radius: 6px;
         }
         .live-speed {
-            font-size: 0.75em;
+            font-size: 0.8em;
             display: flex;
             align-items: center;
-            gap: 8px;
-            margin-top: 4px;
+            gap: 10px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.05);
             color: var(--text-secondary);
         }
-        .live-speed .rx-speed { color: var(--accent); }
-        .live-speed .tx-speed { color: var(--warning); }
+        .live-speed .rx-speed { color: var(--accent); font-weight: 500; }
+        .live-speed .tx-speed { color: var(--warning); font-weight: 500; }
         
         .client-meta { 
             color: var(--text-secondary); 
-            font-size: 0.8em;
+            font-size: 0.85em;
             display: flex;
             flex-wrap: wrap;
-            gap: 6px 12px;
-            margin-top: 4px;
+            gap: 8px 16px;
+            margin-top: 6px;
         }
         .client-meta span {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
         }
         
         .geo-flag {
@@ -760,16 +843,17 @@ TEMPLATE = '''
         
         .client-actions { 
             display: flex; 
-            gap: 5px; 
+            gap: 8px; 
             flex-wrap: wrap;
             justify-content: flex-end;
         }
         
         .last-seen {
-            font-size: 0.75em;
+            font-size: 0.8em;
             color: var(--text-secondary);
-            margin-top: 4px;
+            margin-top: 8px;
             font-style: italic;
+            opacity: 0.8;
         }
         
         .flash {
@@ -785,52 +869,63 @@ TEMPLATE = '''
             display: none;
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0,0,0,0.85);
+            backdrop-filter: blur(4px);
             justify-content: center;
             align-items: center;
             z-index: 1000;
-            padding: 15px;
+            padding: 20px;
         }
         .modal.active { display: flex; }
         
         .modal-content {
             background: var(--bg-secondary);
-            padding: 20px;
-            border-radius: 10px;
-            max-width: 500px;
+            padding: 28px;
+            border-radius: 16px;
+            max-width: 480px;
             width: 100%;
             max-height: 90vh;
             overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
         }
         .modal-content h2 { 
-            margin-bottom: 15px; 
+            margin-bottom: 20px; 
             color: var(--accent);
-            font-size: 1.2em;
+            font-size: 1.3em;
+            font-weight: 600;
         }
         
-        .form-group { margin-bottom: 12px; }
+        .form-group { margin-bottom: 16px; }
         .form-group label { 
             display: block; 
-            margin-bottom: 4px; 
+            margin-bottom: 6px; 
             color: var(--text-secondary);
             font-size: 0.85em;
+            font-weight: 500;
         }
         .form-group input, .form-group textarea {
             width: 100%;
-            padding: 10px;
-            border: 1px solid #4a4a6a;
-            border-radius: 5px;
+            padding: 12px 14px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
             background: var(--bg-primary);
             color: var(--text-primary);
             font-size: 0.95em;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        .form-group textarea { resize: vertical; min-height: 60px; }
+        .form-group input:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.15);
+        }
+        .form-group textarea { resize: vertical; min-height: 80px; }
         
         .form-actions { 
             display: flex; 
-            gap: 8px; 
+            gap: 10px; 
             justify-content: flex-end;
-            margin-top: 15px;
+            margin-top: 20px;
         }
         
         .qr-container { text-align: center; padding: 15px; }
@@ -873,25 +968,33 @@ TEMPLATE = '''
         .login-container { max-width: 350px; margin: 80px auto; }
         
         .theme-toggle {
-            background: transparent;
-            border: 1px solid var(--text-secondary);
+            background: var(--bg-tertiary);
+            border: 1px solid rgba(255,255,255,0.1);
             color: var(--text-primary);
-            padding: 6px 10px;
-            border-radius: 5px;
+            padding: 8px 12px;
+            border-radius: 8px;
             cursor: pointer;
             font-size: 1em;
+            transition: all 0.2s ease;
+        }
+        .theme-toggle:hover {
+            background: var(--bg-secondary);
+            border-color: rgba(255,255,255,0.2);
         }
         
         .refresh-indicator {
-            font-size: 0.75em;
+            font-size: 0.8em;
             color: var(--text-secondary);
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 6px;
+            padding: 6px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 20px;
         }
         .refresh-indicator .dot {
-            width: 6px;
-            height: 6px;
+            width: 8px;
+            height: 8px;
             background: var(--success);
             border-radius: 50%;
             animation: blink 1s infinite;
@@ -966,6 +1069,9 @@ TEMPLATE = '''
         
         <div id="dashboard-content">
             <div class="stats-grid" id="stats-grid"></div>
+            <div class="map-container">
+                <div id="client-map"></div>
+            </div>
             <div class="card">
                 <div class="client-grid" id="client-grid"></div>
             </div>
@@ -1254,6 +1360,9 @@ TEMPLATE = '''
                                 </div>
                             `}).join('');
                         }
+                        
+                        // Update map with client locations
+                        updateMap(data.clients);
                     })
                     .catch(err => console.error('Refresh failed:', err));
             }
@@ -1272,6 +1381,100 @@ TEMPLATE = '''
                     i++;
                 }
                 return bytesPerSec.toFixed(1) + ' ' + units[i];
+            }
+            
+            // Map initialization
+            let clientMap = null;
+            let mapMarkers = [];
+            
+            function initMap() {
+                if (clientMap) return;
+                
+                // Dark themed map tiles
+                const darkTiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+                    subdomains: 'abcd',
+                    maxZoom: 19
+                });
+                
+                clientMap = L.map('client-map', {
+                    center: [39.0, -77.5],  // Default: roughly US East Coast
+                    zoom: 4,
+                    layers: [darkTiles],
+                    zoomControl: true,
+                    attributionControl: true
+                });
+                
+                // Style attribution
+                document.querySelector('.leaflet-control-attribution').style.cssText = 
+                    'background: rgba(37,37,66,0.8) !important; color: #888 !important; font-size: 10px;';
+            }
+            
+            function updateMap(clients) {
+                if (!clientMap) {
+                    initMap();
+                }
+                
+                // Clear existing markers
+                mapMarkers.forEach(m => clientMap.removeLayer(m));
+                mapMarkers = [];
+                
+                // Filter clients with geo data
+                const geoClients = clients.filter(c => c.geo && c.geo.lat && c.geo.lon);
+                
+                if (geoClients.length === 0) {
+                    // No geo data, show empty state
+                    return;
+                }
+                
+                // Add markers
+                const bounds = [];
+                geoClients.forEach(client => {
+                    const pos = [client.geo.lat, client.geo.lon];
+                    bounds.push(pos);
+                    
+                    // Custom icon color based on connection status
+                    const color = client.connected ? '#00d4aa' : '#666';
+                    const glowColor = client.connected ? 'rgba(0,212,170,0.4)' : 'transparent';
+                    
+                    const icon = L.divIcon({
+                        className: 'custom-marker',
+                        html: `<div style="
+                            width: 16px;
+                            height: 16px;
+                            background: ${color};
+                            border: 2px solid white;
+                            border-radius: 50%;
+                            box-shadow: 0 0 10px ${glowColor}, 0 2px 6px rgba(0,0,0,0.3);
+                        "></div>`,
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                    });
+                    
+                    const marker = L.marker(pos, { icon: icon }).addTo(clientMap);
+                    
+                    // Popup content
+                    const popupContent = `
+                        <div class="map-popup-title">${client.name}</div>
+                        <div class="map-popup-info">
+                            ${client.geo.city ? client.geo.city + ', ' : ''}${client.geo.country}<br>
+                            ${client.connected ? '🟢 Connected' : '⚫ Offline'}
+                            ${client.connected && client.connection_duration_fmt ? ' • ' + client.connection_duration_fmt : ''}
+                        </div>
+                    `;
+                    marker.bindPopup(popupContent);
+                    
+                    mapMarkers.push(marker);
+                });
+                
+                // Fit bounds with padding
+                if (bounds.length > 0) {
+                    if (bounds.length === 1) {
+                        clientMap.setView(bounds[0], 10);
+                    } else {
+                        clientMap.fitBounds(bounds, { padding: [30, 30], maxZoom: 12 });
+                    }
+                }
             }
         </script>
         {% endif %}

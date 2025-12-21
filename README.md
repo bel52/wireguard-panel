@@ -18,7 +18,7 @@ A lightweight, self-hosted WireGuard VPN management solution with both CLI and w
 - **Connection status** — live connected/offline indicators with 5-minute threshold
 - **Connection duration** — shows how long each client has been connected
 - **Bandwidth monitoring** — per-client sparkline graphs showing live activity
-- **GeoIP location** — shows country/city for connected clients
+- **GeoIP location** — shows country/city for connected clients with map view
 - **Client management** — add, revoke, download configs, view QR codes
 - **Client notes** — add descriptions like "Dad's laptop"
 - **Connection history** — logs of all connect/disconnect/create/revoke events
@@ -27,37 +27,152 @@ A lightweight, self-hosted WireGuard VPN management solution with both CLI and w
 
 ## Requirements
 
-- Ubuntu 22.04+ (tested on Ubuntu 24.04)
-- WireGuard installed and configured
-- Python 3.10+
-- Root access
+### System Requirements
+- **OS:** Ubuntu 22.04 LTS or newer (tested on Ubuntu 24.04 LTS)
+- **Architecture:** x86_64 or ARM64
+- **RAM:** 512 MB minimum
+- **Disk:** 100 MB free space
 
-## Quick Start
+### Prerequisites
+Before running the installer, you must have:
 
-### 1. Clone the repository
+1. **WireGuard installed and configured** with a working `wg0` interface:
+   ```bash
+   # Install WireGuard
+   sudo apt update
+   sudo apt install wireguard wireguard-tools
+
+   # Verify installation
+   wg --version
+   ```
+
+2. **A working WireGuard server configuration** at `/etc/wireguard/wg0.conf`:
+   ```ini
+   [Interface]
+   PrivateKey = <your_server_private_key>
+   Address = 10.6.0.1/24
+   ListenPort = 51820
+   PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+   PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+   ```
+
+3. **Server keys generated**:
+   ```bash
+   # Generate server keys (if not already done)
+   cd /etc/wireguard
+   umask 077
+   wg genkey | tee server.key | wg pubkey > server.pub
+   ```
+
+4. **IP forwarding enabled**:
+   ```bash
+   # Enable IP forwarding
+   echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+   sudo sysctl -p
+   ```
+
+5. **WireGuard interface running**:
+   ```bash
+   sudo systemctl enable wg-quick@wg0
+   sudo systemctl start wg-quick@wg0
+   sudo wg show  # Verify it's running
+   ```
+
+### Network Requirements
+- **UDP port 51820** open for WireGuard VPN traffic
+- **TCP port 5000** open for web panel (configurable)
+- Public IP or domain name for VPN endpoint
+
+## Installation
+
+### Quick Install
 
 ```bash
+# Clone the repository
 git clone https://github.com/bel52/wireguard-panel.git
 cd wireguard-panel
-```
 
-### 2. Run the installer
-
-```bash
+# Run installer (interactive - will prompt for credentials)
 sudo ./install.sh
 ```
 
-The installer will:
-- Install dependencies (Python, Flask, qrencode)
-- Install `wg-tool` to `/usr/local/sbin/`
-- Install `wg-panel` to `/opt/wg-panel/`
-- Create a systemd service
-- Prompt for web panel credentials
+### What the Installer Does
 
-### 3. Access the panel
+1. Installs system dependencies:
+   - `python3`, `python3-venv`, `python3-pip`
+   - `qrencode` (for QR code generation)
+
+2. Installs `wg-tool` CLI to `/usr/local/sbin/wg-tool`
+
+3. Sets up the web panel:
+   - Creates `/opt/wg-panel/` directory
+   - Creates Python virtual environment
+   - Installs Flask web framework
+   - Initializes SQLite database for notes/history
+
+4. Configures systemd service `wg-panel.service`
+
+5. Opens firewall port (if UFW is active)
+
+### Manual Installation
+
+If you prefer to install manually:
+
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip qrencode
+
+# Install CLI tool
+sudo cp wg-tool /usr/local/sbin/wg-tool
+sudo chmod 755 /usr/local/sbin/wg-tool
+
+# Set up web panel
+sudo mkdir -p /opt/wg-panel
+sudo cp wg-panel/app.py /opt/wg-panel/
+sudo python3 -m venv /opt/wg-panel/venv
+sudo /opt/wg-panel/venv/bin/pip install flask
+
+# Create systemd service (see install.sh for template)
+# Configure environment variables for authentication
+```
+
+### Post-Installation
+
+1. **Open firewall port** (if not done automatically):
+   ```bash
+   sudo ufw allow 5000/tcp
+   ```
+
+2. **Open cloud firewall** (AWS/GCP/Azure):
+   - Add inbound rule for TCP port 5000
+
+3. **Access the panel**:
+   ```
+   http://YOUR_SERVER_IP:5000
+   ```
+
+## Directory Structure
+
+After installation:
 
 ```
-http://YOUR_SERVER_IP:5000
+/etc/wireguard/
+├── wg0.conf              # WireGuard server config
+├── server.key            # Server private key
+├── server.pub            # Server public key
+└── clients/              # Client configs (created by wg-tool)
+    ├── client1.conf
+    ├── client1.key
+    └── client1.pub
+
+/opt/wg-panel/
+├── app.py                # Web panel application
+├── wg-panel.db           # SQLite database (notes, history)
+└── venv/                 # Python virtual environment
+
+/usr/local/sbin/
+└── wg-tool               # CLI management script
 ```
 
 ## CLI Usage
