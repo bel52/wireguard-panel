@@ -1616,7 +1616,9 @@ TEMPLATE = '''
                 <div class="health-details" id="healthDetails"></div>
             </div>
 
-            <div class="stats-grid" id="stats-grid"></div>
+            <div class="stats-grid" id="stats-grid">
+                <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
+            </div>
 
             <!-- Activity Strip -->
             <div class="activity-strip" id="activityStrip">
@@ -1645,7 +1647,9 @@ TEMPLATE = '''
                         <option value="tx">Sort: Data Sent</option>
                     </select>
                 </div>
-                <div class="client-grid" id="client-grid"></div>
+                <div class="client-grid" id="client-grid">
+                    <div class="empty-state">Loading clients...</div>
+                </div>
             </div>
 
             <!-- Collapsible Map -->
@@ -1755,7 +1759,7 @@ TEMPLATE = '''
             let currentFilter = 'all';
             let trafficTimeWindow = '1h';
             let demoMode = localStorage.getItem('demoMode') === 'true';
-            let mapExpanded = localStorage.getItem('mapExpanded') !== 'false'; // Default to collapsed
+            let mapExpanded = localStorage.getItem('mapExpanded') === 'true'; // Default to collapsed (false)
 
             // ===== Theme =====
             function toggleTheme() {
@@ -2223,10 +2227,13 @@ TEMPLATE = '''
             // ===== Dashboard Refresh =====
             function refreshDashboard() {
                 fetch('/api/status')
-                    .then(r => r.json())
+                    .then(r => {
+                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                        return r.json();
+                    })
                     .then(data => {
                         currentStats = data.stats;
-                        allClients = data.clients;
+                        allClients = data.clients || [];
 
                         // Update stats
                         updateStatsDisplay();
@@ -2235,14 +2242,26 @@ TEMPLATE = '''
                         filterAndSortClients();
 
                         // Update map
-                        updateMap(data.clients);
+                        updateMap(data.clients || []);
 
                         // Update map client count
-                        const geoCount = data.clients.filter(c => c.geo && c.geo.lat).length;
-                        const connectedGeo = data.clients.filter(c => c.connected && c.geo && c.geo.lat).length;
+                        const clients = data.clients || [];
+                        const geoCount = clients.filter(c => c.geo && c.geo.lat).length;
+                        const connectedGeo = clients.filter(c => c.connected && c.geo && c.geo.lat).length;
                         document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
                     })
-                    .catch(err => console.error('Refresh failed:', err));
+                    .catch(err => {
+                        console.error('Refresh failed:', err);
+                        // Show error state in stats grid
+                        document.getElementById('stats-grid').innerHTML = `
+                            <div class="stat-box warning">
+                                <div class="number">!</div>
+                                <div class="label">API Error</div>
+                            </div>
+                        `;
+                        document.getElementById('client-grid').innerHTML =
+                            '<div class="empty-state">Failed to load data. Check server connection.</div>';
+                    });
             }
 
             // ===== Map =====
@@ -2349,14 +2368,24 @@ TEMPLATE = '''
             }
 
             // ===== Initial Load =====
-            refreshDashboard();
-            fetchHealth();
-            updateActivityStrip();
+            try {
+                refreshDashboard();
+                fetchHealth();
+                updateActivityStrip();
+            } catch (e) {
+                console.error('Initial load error:', e);
+            }
 
             // Auto-refresh intervals
-            setInterval(refreshDashboard, 5000);
-            setInterval(fetchHealth, 30000);
-            setInterval(updateActivityStrip, 15000);
+            setInterval(() => {
+                try { refreshDashboard(); } catch (e) { console.error('Refresh error:', e); }
+            }, 5000);
+            setInterval(() => {
+                try { fetchHealth(); } catch (e) { console.error('Health error:', e); }
+            }, 30000);
+            setInterval(() => {
+                try { updateActivityStrip(); } catch (e) { console.error('Activity error:', e); }
+            }, 15000);
         </script>
         {% endif %}
     </div>
