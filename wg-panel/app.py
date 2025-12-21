@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WireGuard Web Panel v3
+WireGuard Web Panel v4
 
 Features:
 - Realtime auto-refresh (5 second polling)
@@ -13,6 +13,10 @@ Features:
 - GeoIP endpoint location
 - Dark/light mode toggle
 - Mobile-friendly responsive design
+- Health & Risk monitoring
+- Rolling window traffic stats (1h/24h)
+- Demo-safe mode for presentations
+- Collapsible map view
 """
 
 import subprocess
@@ -22,6 +26,8 @@ import secrets
 import sqlite3
 import json
 import time
+import threading
+from collections import deque
 from functools import wraps
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,9 +43,17 @@ AUTH_USER = os.environ.get('WG_PANEL_USER', 'admin')
 AUTH_PASS_HASH = os.environ.get('WG_PANEL_PASS_HASH', '')
 AUTH_PASS_PLAIN = os.environ.get('WG_PANEL_PASS', '')
 DB_PATH = os.environ.get('WG_PANEL_DB', '/opt/wg-panel/wg-panel.db')
+DNS_CHECK_ENABLED = os.environ.get('WG_PANEL_DNS_CHECK', '').lower() in ('1', 'true', 'yes')
+DNS_CHECK_SERVER = os.environ.get('WG_PANEL_DNS_SERVER', '10.6.0.1')
 GEOIP_CACHE = {}
 BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
 CONNECTION_THRESHOLD_SECONDS = 300  # 5 minutes
+
+# Traffic ring buffer for 1h/24h stats (stores samples with timestamps)
+# Each sample: {'timestamp': epoch, 'rx': bytes, 'tx': bytes}
+TRAFFIC_RING_BUFFER = deque(maxlen=17280)  # 24h at 5s intervals
+TRAFFIC_BUFFER_LOCK = threading.Lock()
+LAST_TRAFFIC_SAMPLE = {'rx': 0, 'tx': 0, 'time': 0}
 
 # --------------- Database ---------------
 
@@ -210,11 +224,151 @@ def get_server_uptime():
 
 def get_wg_uptime():
     try:
-        result = subprocess.run(['sudo', 'wg', 'show', 'wg0'], 
+        result = subprocess.run(['sudo', 'wg', 'show', 'wg0'],
                                 capture_output=True, text=True, timeout=5)
         return "active" if result.returncode == 0 else "down"
     except:
         return "unknown"
+
+
+# --------------- Health Check Functions ---------------
+
+def check_wg_interface():
+    """Check if WireGuard interface wg0 is up."""
+    try:
+        result = subprocess.run(['sudo', 'wg', 'show', 'wg0'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return {'name': 'WireGuard interface', 'status': 'ok', 'detail': 'wg0 up and running'}
+        return {'name': 'WireGuard interface', 'status': 'fail', 'detail': 'wg0 not found or down'}
+    except subprocess.TimeoutExpired:
+        return {'name': 'WireGuard interface', 'status': 'fail', 'detail': 'Command timed out'}
+    except Exception as e:
+        return {'name': 'WireGuard interface', 'status': 'fail', 'detail': str(e)[:50]}
+
+def check_ip_forwarding():
+    """Check if IPv4 forwarding is enabled."""
+    try:
+        result = subprocess.run(['sysctl', 'net.ipv4.ip_forward'],
+                                capture_output=True, text=True, timeout=5)
+        if 'net.ipv4.ip_forward = 1' in result.stdout:
+            return {'name': 'IP forwarding', 'status': 'ok', 'detail': 'net.ipv4.ip_forward=1'}
+        return {'name': 'IP forwarding', 'status': 'warn', 'detail': 'IPv4 forwarding disabled'}
+    except Exception as e:
+        return {'name': 'IP forwarding', 'status': 'warn', 'detail': str(e)[:50]}
+
+def check_nat_masquerade():
+    """Check if NAT/masquerade rules exist."""
+    try:
+        # Try iptables first
+        result = subprocess.run(['sudo', 'iptables', '-t', 'nat', '-L', 'POSTROUTING', '-n'],
+                                capture_output=True, text=True, timeout=5)
+        if 'MASQUERADE' in result.stdout or 'SNAT' in result.stdout:
+            return {'name': 'NAT/masquerade', 'status': 'ok', 'detail': 'iptables NAT rule present'}
+
+        # Try nftables
+        result = subprocess.run(['sudo', 'nft', 'list', 'ruleset'],
+                                capture_output=True, text=True, timeout=5)
+        if 'masquerade' in result.stdout.lower() or 'snat' in result.stdout.lower():
+            return {'name': 'NAT/masquerade', 'status': 'ok', 'detail': 'nftables NAT rule present'}
+
+        return {'name': 'NAT/masquerade', 'status': 'warn', 'detail': 'No NAT rules found'}
+    except Exception as e:
+        return {'name': 'NAT/masquerade', 'status': 'warn', 'detail': str(e)[:50]}
+
+def check_dns_reachability():
+    """Check if DNS server is reachable (optional check)."""
+    if not DNS_CHECK_ENABLED:
+        return None
+
+    try:
+        result = subprocess.run(['dig', f'@{DNS_CHECK_SERVER}', 'google.com', '+short', '+time=2'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return {'name': 'DNS reachability', 'status': 'ok', 'detail': f'DNS @{DNS_CHECK_SERVER} responding'}
+        return {'name': 'DNS reachability', 'status': 'warn', 'detail': f'DNS @{DNS_CHECK_SERVER} not responding'}
+    except Exception as e:
+        return {'name': 'DNS reachability', 'status': 'warn', 'detail': str(e)[:50]}
+
+def get_health_status():
+    """Get comprehensive health status with all checks."""
+    checks = []
+
+    # Run all checks
+    checks.append(check_wg_interface())
+    checks.append(check_ip_forwarding())
+    checks.append(check_nat_masquerade())
+
+    # DNS check (optional)
+    dns_check = check_dns_reachability()
+    if dns_check:
+        checks.append(dns_check)
+
+    # Determine overall status
+    statuses = [c['status'] for c in checks]
+    if 'fail' in statuses:
+        overall = 'down'
+    elif 'warn' in statuses:
+        overall = 'degraded'
+    else:
+        overall = 'healthy'
+
+    return {
+        'overall': overall,
+        'checks': checks,
+        'timestamp': datetime.now().isoformat()
+    }
+
+
+# --------------- Traffic Ring Buffer Functions ---------------
+
+def record_traffic_sample(total_rx, total_tx):
+    """Record a traffic sample to the ring buffer for 1h/24h stats."""
+    global LAST_TRAFFIC_SAMPLE
+
+    now = time.time()
+
+    with TRAFFIC_BUFFER_LOCK:
+        # Calculate delta from last sample
+        if LAST_TRAFFIC_SAMPLE['time'] > 0:
+            rx_delta = max(0, total_rx - LAST_TRAFFIC_SAMPLE['rx'])
+            tx_delta = max(0, total_tx - LAST_TRAFFIC_SAMPLE['tx'])
+
+            # Only record if there's actual traffic or it's been a while
+            TRAFFIC_RING_BUFFER.append({
+                'timestamp': now,
+                'rx': rx_delta,
+                'tx': tx_delta
+            })
+
+        LAST_TRAFFIC_SAMPLE = {'rx': total_rx, 'tx': total_tx, 'time': now}
+
+def get_traffic_windows():
+    """Calculate traffic for last 1h and 24h windows."""
+    now = time.time()
+    hour_ago = now - 3600
+    day_ago = now - 86400
+
+    rx_1h = 0
+    tx_1h = 0
+    rx_24h = 0
+    tx_24h = 0
+
+    with TRAFFIC_BUFFER_LOCK:
+        for sample in TRAFFIC_RING_BUFFER:
+            ts = sample['timestamp']
+            if ts >= day_ago:
+                rx_24h += sample['rx']
+                tx_24h += sample['tx']
+                if ts >= hour_ago:
+                    rx_1h += sample['rx']
+                    tx_1h += sample['tx']
+
+    return {
+        'last1h': {'rxBytes': rx_1h, 'txBytes': tx_1h},
+        'last24h': {'rxBytes': rx_24h, 'txBytes': tx_24h}
+    }
+
 
 # --------------- WireGuard Functions ---------------
 
@@ -428,14 +582,20 @@ def get_clients():
 
 def get_server_stats():
     peers = parse_wg_show()
-    
-    connected = sum(1 for p in peers 
-                    if p.get('handshake_seconds') is not None 
+
+    connected = sum(1 for p in peers
+                    if p.get('handshake_seconds') is not None
                     and p['handshake_seconds'] < CONNECTION_THRESHOLD_SECONDS)
-    
+
     total_rx = sum(p.get('transfer_rx', 0) for p in peers)
     total_tx = sum(p.get('transfer_tx', 0) for p in peers)
-    
+
+    # Record traffic sample for rolling window stats
+    record_traffic_sample(total_rx, total_tx)
+
+    # Get traffic windows (1h/24h)
+    traffic_windows = get_traffic_windows()
+
     return {
         'uptime': get_server_uptime(),
         'wg_status': get_wg_uptime(),
@@ -444,7 +604,16 @@ def get_server_stats():
         'total_rx': total_rx,
         'total_tx': total_tx,
         'total_rx_fmt': format_bytes(total_rx),
-        'total_tx_fmt': format_bytes(total_tx)
+        'total_tx_fmt': format_bytes(total_tx),
+        'traffic': {
+            'total': {'rxBytes': total_rx, 'txBytes': total_tx},
+            'last1h': traffic_windows['last1h'],
+            'last24h': traffic_windows['last24h'],
+            'last1h_rx_fmt': format_bytes(traffic_windows['last1h']['rxBytes']),
+            'last1h_tx_fmt': format_bytes(traffic_windows['last1h']['txBytes']),
+            'last24h_rx_fmt': format_bytes(traffic_windows['last24h']['rxBytes']),
+            'last24h_tx_fmt': format_bytes(traffic_windows['last24h']['txBytes'])
+        }
     }
 
 def get_connection_history(client_name=None, limit=50):
@@ -1011,10 +1180,10 @@ TEMPLATE = '''
         }
         
         @media (max-width: 600px) {
-            .client-card { 
+            .client-card {
                 grid-template-columns: auto 1fr;
             }
-            .client-actions { 
+            .client-actions {
                 grid-column: span 2;
                 justify-content: flex-start;
                 margin-top: 8px;
@@ -1022,6 +1191,366 @@ TEMPLATE = '''
             .stats-grid {
                 grid-template-columns: repeat(2, 1fr);
             }
+            .client-controls {
+                flex-direction: column;
+            }
+            .filter-group {
+                flex-wrap: wrap;
+            }
+        }
+
+        /* Health Card Styles */
+        .health-card {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            padding: 16px 20px;
+            border-radius: 14px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.05);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .health-card:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+        }
+        .health-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .health-status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .health-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+        .health-indicator.degraded {
+            background: var(--warning);
+            box-shadow: 0 0 8px var(--warning);
+        }
+        .health-indicator.down {
+            background: var(--danger);
+            box-shadow: 0 0 8px var(--danger);
+        }
+        .health-title {
+            font-weight: 600;
+            font-size: 1em;
+        }
+        .health-title .status-text {
+            color: var(--success);
+            margin-left: 8px;
+        }
+        .health-title .status-text.degraded { color: var(--warning); }
+        .health-title .status-text.down { color: var(--danger); }
+        .health-chevron {
+            color: var(--text-secondary);
+            transition: transform 0.2s ease;
+        }
+        .health-chevron.expanded {
+            transform: rotate(180deg);
+        }
+        .health-details {
+            display: none;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        .health-details.expanded {
+            display: block;
+        }
+        .health-check {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            font-size: 0.9em;
+        }
+        .check-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .check-status.ok { background: var(--success); }
+        .check-status.warn { background: var(--warning); }
+        .check-status.fail { background: var(--danger); }
+        .check-name { color: var(--text-primary); min-width: 140px; }
+        .check-detail { color: var(--text-secondary); font-size: 0.85em; }
+
+        /* Demo Mode Styles */
+        .demo-toggle {
+            background: var(--bg-tertiary);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: all 0.2s ease;
+        }
+        .demo-toggle:hover {
+            background: var(--bg-secondary);
+        }
+        .demo-toggle.active {
+            background: var(--warning);
+            color: var(--bg-primary);
+            border-color: var(--warning);
+        }
+        .demo-pill {
+            display: none;
+            background: var(--warning);
+            color: var(--bg-primary);
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75em;
+            font-weight: 600;
+        }
+        .demo-pill.active {
+            display: inline-block;
+        }
+
+        /* Map Collapse Styles */
+        .map-collapse-header {
+            background: var(--bg-secondary);
+            padding: 14px 18px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: all 0.2s ease;
+        }
+        .map-collapse-header:hover {
+            background: var(--bg-tertiary);
+        }
+        .map-collapse-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 500;
+        }
+        .map-collapse-count {
+            color: var(--text-secondary);
+            font-size: 0.9em;
+        }
+        .map-wrapper {
+            display: none;
+        }
+        .map-wrapper.expanded {
+            display: block;
+        }
+
+        /* Client Controls */
+        .client-controls {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .search-box {
+            flex: 1;
+            min-width: 200px;
+            position: relative;
+        }
+        .search-box input {
+            width: 100%;
+            padding: 10px 14px 10px 36px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 0.9em;
+        }
+        .search-box input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .search-box::before {
+            content: "🔍";
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.85em;
+            opacity: 0.6;
+        }
+        .filter-group {
+            display: flex;
+            gap: 6px;
+        }
+        .filter-btn {
+            padding: 8px 14px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            font-size: 0.8em;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .filter-btn:hover {
+            background: var(--bg-secondary);
+        }
+        .filter-btn.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+        .sort-select {
+            padding: 10px 14px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 0.85em;
+            cursor: pointer;
+        }
+
+        /* Icon Buttons with Tooltips */
+        .icon-btn {
+            padding: 8px;
+            border: none;
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+            font-size: 0.9em;
+            line-height: 1;
+        }
+        .icon-btn:hover {
+            background: var(--accent);
+            color: var(--bg-primary);
+        }
+        .icon-btn.danger:hover {
+            background: var(--danger);
+            color: white;
+        }
+        .icon-btn[title]:hover::after {
+            content: attr(title);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 4px 8px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 0.75em;
+            border-radius: 4px;
+            white-space: nowrap;
+            margin-bottom: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .copy-btn {
+            padding: 2px 6px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.8em;
+            opacity: 0.6;
+            transition: opacity 0.2s;
+        }
+        .copy-btn:hover {
+            opacity: 1;
+            color: var(--accent);
+        }
+
+        /* Stat Toggle */
+        .stat-toggle {
+            display: flex;
+            gap: 4px;
+            margin-top: 8px;
+        }
+        .stat-toggle button {
+            padding: 2px 8px;
+            border: none;
+            border-radius: 4px;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.7em;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .stat-toggle button.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+        }
+        .stat-total {
+            font-size: 0.7em;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        /* Activity Strip */
+        .activity-strip {
+            background: var(--bg-secondary);
+            padding: 12px 16px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+        }
+        .activity-strip-title {
+            font-size: 0.8em;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .activity-items {
+            display: flex;
+            gap: 12px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+        }
+        .activity-item {
+            flex-shrink: 0;
+            font-size: 0.8em;
+            padding: 6px 10px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .activity-item .time {
+            color: var(--text-secondary);
+        }
+        .activity-item.created { border-left: 3px solid var(--accent); }
+        .activity-item.revoked { border-left: 3px solid var(--danger); }
+        .activity-item.connected { border-left: 3px solid var(--success); }
+        .activity-item.disconnected { border-left: 3px solid var(--warning); }
+
+        /* Subtitle */
+        .header-subtitle {
+            font-size: 0.8em;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            font-weight: 400;
+        }
+
+        /* Last handshake prominent */
+        .handshake-badge {
+            background: var(--bg-secondary);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            color: var(--accent);
+        }
+        .handshake-badge.stale {
+            color: var(--warning);
         }
     </style>
 </head>
@@ -1051,11 +1580,16 @@ TEMPLATE = '''
         {% else %}
         <!-- Dashboard -->
         <div class="header">
-            <h1>WireGuard Panel</h1>
+            <div>
+                <h1>WireGuard Panel</h1>
+                <div class="header-subtitle">WireGuard • Clients • Traffic • Activity</div>
+            </div>
             <div class="header-actions">
+                <span class="demo-pill" id="demoPill">Demo Mode</span>
                 <span class="refresh-indicator"><span class="dot"></span> Live</span>
                 <button class="btn" onclick="showAddModal()">+ Add Client</button>
                 <button class="btn btn-secondary" onclick="showHistoryModal()">History</button>
+                <button class="demo-toggle" id="demoToggle" onclick="toggleDemoMode()">Demo</button>
                 <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
                 <a href="{{ url_for('logout') }}" class="btn btn-secondary">Logout</a>
             </div>
@@ -1068,12 +1602,64 @@ TEMPLATE = '''
         </div>
         
         <div id="dashboard-content">
+            <!-- Health Card -->
+            <div class="health-card" id="healthCard" onclick="toggleHealthDetails()">
+                <div class="health-header">
+                    <div class="health-status">
+                        <div class="health-indicator" id="healthIndicator"></div>
+                        <div class="health-title">
+                            Status: <span class="status-text" id="healthStatusText">Checking...</span>
+                        </div>
+                    </div>
+                    <span class="health-chevron" id="healthChevron">▼</span>
+                </div>
+                <div class="health-details" id="healthDetails"></div>
+            </div>
+
             <div class="stats-grid" id="stats-grid"></div>
+
+            <!-- Activity Strip -->
+            <div class="activity-strip" id="activityStrip">
+                <div class="activity-strip-title">Recent Activity</div>
+                <div class="activity-items" id="activityItems">
+                    <div class="activity-item">Loading...</div>
+                </div>
+            </div>
+
             <div class="card">
+                <!-- Client Controls: Search, Filter, Sort -->
+                <div class="client-controls">
+                    <div class="search-box">
+                        <input type="text" id="clientSearch" placeholder="Search clients..." oninput="filterAndSortClients()">
+                    </div>
+                    <div class="filter-group">
+                        <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
+                        <button class="filter-btn" data-filter="connected" onclick="setFilter('connected')">Connected</button>
+                        <button class="filter-btn" data-filter="offline" onclick="setFilter('offline')">Offline</button>
+                        <button class="filter-btn" data-filter="recent" onclick="setFilter('recent')">Last 24h</button>
+                    </div>
+                    <select class="sort-select" id="sortSelect" onchange="filterAndSortClients()">
+                        <option value="name">Sort: Name</option>
+                        <option value="handshake">Sort: Last Handshake</option>
+                        <option value="rx">Sort: Data Received</option>
+                        <option value="tx">Sort: Data Sent</option>
+                    </select>
+                </div>
                 <div class="client-grid" id="client-grid"></div>
             </div>
-            <div class="map-container">
-                <div id="client-map"></div>
+
+            <!-- Collapsible Map -->
+            <div class="map-collapse-header" id="mapCollapseHeader" onclick="toggleMap()">
+                <div class="map-collapse-title">
+                    <span>🗺️ Map</span>
+                    <span class="map-collapse-count" id="mapClientCount">(0 with location)</span>
+                </div>
+                <span id="mapChevron">▼</span>
+            </div>
+            <div class="map-wrapper" id="mapWrapper">
+                <div class="map-container">
+                    <div id="client-map"></div>
+                </div>
             </div>
         </div>
         
@@ -1164,7 +1750,14 @@ TEMPLATE = '''
         </div>
         
         <script>
-            // Theme
+            // ===== State Management =====
+            let allClients = [];
+            let currentFilter = 'all';
+            let trafficTimeWindow = '1h';
+            let demoMode = localStorage.getItem('demoMode') === 'true';
+            let mapExpanded = localStorage.getItem('mapExpanded') !== 'false'; // Default to collapsed
+
+            // ===== Theme =====
             function toggleTheme() {
                 const html = document.documentElement;
                 const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
@@ -1173,8 +1766,157 @@ TEMPLATE = '''
             }
             const savedTheme = localStorage.getItem('theme');
             if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
-            
-            // Modals
+
+            // ===== Demo Mode =====
+            function toggleDemoMode() {
+                demoMode = !demoMode;
+                localStorage.setItem('demoMode', demoMode);
+                updateDemoModeUI();
+                filterAndSortClients();
+            }
+
+            function updateDemoModeUI() {
+                const toggle = document.getElementById('demoToggle');
+                const pill = document.getElementById('demoPill');
+                if (demoMode) {
+                    toggle.classList.add('active');
+                    pill.classList.add('active');
+                } else {
+                    toggle.classList.remove('active');
+                    pill.classList.remove('active');
+                }
+            }
+
+            function redactIP(ip) {
+                if (!demoMode || !ip) return ip;
+                // Redact IP addresses
+                return ip.replace(/\d+\.\d+\.\d+\.\d+/g, 'xxx.xxx.xxx.xxx')
+                         .replace(/:\d+/g, ':xxxxx');
+            }
+
+            function redactVPNIP(ip) {
+                if (!demoMode || !ip) return ip;
+                // Partially mask VPN IPs like 10.6.0.2 -> 10.6.0.x
+                return ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1x');
+            }
+
+            function redactLocation(geo) {
+                if (!demoMode || !geo) return geo;
+                return { ...geo, city: 'Redacted', country: geo.country_code ? geo.country_code.toUpperCase() : 'XX' };
+            }
+
+            // Initialize demo mode UI
+            updateDemoModeUI();
+
+            // ===== Map Collapse =====
+            function toggleMap() {
+                mapExpanded = !mapExpanded;
+                localStorage.setItem('mapExpanded', mapExpanded);
+                updateMapVisibility();
+            }
+
+            function updateMapVisibility() {
+                const wrapper = document.getElementById('mapWrapper');
+                const chevron = document.getElementById('mapChevron');
+                if (mapExpanded) {
+                    wrapper.classList.add('expanded');
+                    chevron.textContent = '▲';
+                    // Initialize map if not done
+                    if (!clientMap) {
+                        setTimeout(initMap, 100);
+                    } else {
+                        clientMap.invalidateSize();
+                    }
+                } else {
+                    wrapper.classList.remove('expanded');
+                    chevron.textContent = '▼';
+                }
+            }
+
+            // Set initial map state (collapsed by default)
+            mapExpanded = localStorage.getItem('mapExpanded') === 'true';
+            updateMapVisibility();
+
+            // ===== Health Card =====
+            let healthExpanded = false;
+
+            function toggleHealthDetails() {
+                healthExpanded = !healthExpanded;
+                const details = document.getElementById('healthDetails');
+                const chevron = document.getElementById('healthChevron');
+                if (healthExpanded) {
+                    details.classList.add('expanded');
+                    chevron.classList.add('expanded');
+                } else {
+                    details.classList.remove('expanded');
+                    chevron.classList.remove('expanded');
+                }
+            }
+
+            function updateHealthCard(health) {
+                const indicator = document.getElementById('healthIndicator');
+                const statusText = document.getElementById('healthStatusText');
+                const details = document.getElementById('healthDetails');
+
+                // Update indicator
+                indicator.className = 'health-indicator';
+                statusText.className = 'status-text';
+                if (health.overall === 'degraded') {
+                    indicator.classList.add('degraded');
+                    statusText.classList.add('degraded');
+                } else if (health.overall === 'down') {
+                    indicator.classList.add('down');
+                    statusText.classList.add('down');
+                }
+
+                statusText.textContent = health.overall.charAt(0).toUpperCase() + health.overall.slice(1);
+
+                // Update details
+                details.innerHTML = health.checks.map(check => `
+                    <div class="health-check">
+                        <div class="check-status ${check.status}"></div>
+                        <span class="check-name">${check.name}</span>
+                        <span class="check-detail">${check.detail}</span>
+                    </div>
+                `).join('');
+            }
+
+            function fetchHealth() {
+                fetch('/api/health')
+                    .then(r => r.json())
+                    .then(updateHealthCard)
+                    .catch(err => {
+                        console.error('Health check failed:', err);
+                        updateHealthCard({ overall: 'down', checks: [{ name: 'API', status: 'fail', detail: 'Unable to fetch health status' }] });
+                    });
+            }
+
+            // ===== Activity Strip =====
+            function updateActivityStrip() {
+                fetch('/api/history')
+                    .then(r => r.json())
+                    .then(data => {
+                        const items = document.getElementById('activityItems');
+                        if (data.length === 0) {
+                            items.innerHTML = '<div class="activity-item">No recent activity</div>';
+                            return;
+                        }
+                        // Show last 10 events
+                        items.innerHTML = data.slice(0, 10).map(h => {
+                            const time = h.timestamp.split(' ')[1] || h.timestamp;
+                            const endpoint = demoMode ? redactIP(h.endpoint) : h.endpoint;
+                            return `
+                                <div class="activity-item ${h.event_type}">
+                                    <span class="time">${time}</span>
+                                    <span>${h.client_name}: ${h.event_type}</span>
+                                    ${endpoint ? `<span style="opacity:0.6"> ${endpoint}</span>` : ''}
+                                </div>
+                            `;
+                        }).join('');
+                    });
+            }
+
+            // ===== Modals =====
             function showAddModal() { document.getElementById('addModal').classList.add('active'); }
             function showQR(name) {
                 document.getElementById('qrClientName').textContent = name;
@@ -1204,13 +1946,16 @@ TEMPLATE = '''
                         if (data.length === 0) {
                             list.innerHTML = '<div class="empty-state">No history yet</div>';
                         } else {
-                            list.innerHTML = data.map(h => `
-                                <div class="history-item">
-                                    <span class="time">${h.timestamp}</span>
-                                    <span class="event ${h.event_type}">${h.client_name}: ${h.event_type}</span>
-                                    ${h.endpoint ? `<span style="color:var(--text-secondary);font-size:0.85em;"> from ${h.endpoint}</span>` : ''}
-                                </div>
-                            `).join('');
+                            list.innerHTML = data.map(h => {
+                                const endpoint = demoMode ? redactIP(h.endpoint) : h.endpoint;
+                                return `
+                                    <div class="history-item">
+                                        <span class="time">${h.timestamp}</span>
+                                        <span class="event ${h.event_type}">${h.client_name}: ${h.event_type}</span>
+                                        ${endpoint ? `<span style="color:var(--text-secondary);font-size:0.85em;"> from ${endpoint}</span>` : ''}
+                                    </div>
+                                `;
+                            }).join('');
                         }
                         document.getElementById('historyModal').classList.add('active');
                     });
@@ -1227,12 +1972,15 @@ TEMPLATE = '''
                 navigator.clipboard.writeText(document.getElementById('configContent').textContent);
                 alert('Copied!');
             }
-            
+            function copyToClipboard(text) {
+                navigator.clipboard.writeText(text);
+            }
+
             document.addEventListener('keydown', e => { if (e.key === 'Escape') hideModals(); });
             document.querySelectorAll('.modal').forEach(m => {
                 m.addEventListener('click', e => { if (e.target === m) hideModals(); });
             });
-            
+
             // Note form
             document.getElementById('noteForm').addEventListener('submit', function(e) {
                 e.preventDefault();
@@ -1247,18 +1995,83 @@ TEMPLATE = '''
                     refreshDashboard();
                 });
             });
-            
-            // Sparkline generator
+
+            // ===== Filtering & Sorting =====
+            function setFilter(filter) {
+                currentFilter = filter;
+                document.querySelectorAll('.filter-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.filter === filter);
+                });
+                filterAndSortClients();
+            }
+
+            function setTrafficWindow(window) {
+                trafficTimeWindow = window;
+                document.querySelectorAll('.stat-toggle button').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.window === window);
+                });
+                updateStatsDisplay();
+            }
+
+            function filterAndSortClients() {
+                const searchTerm = document.getElementById('clientSearch').value.toLowerCase();
+                const sortBy = document.getElementById('sortSelect').value;
+
+                let filtered = allClients.filter(c => {
+                    // Search filter
+                    const matchesSearch = !searchTerm ||
+                        c.name.toLowerCase().includes(searchTerm) ||
+                        c.ip.toLowerCase().includes(searchTerm) ||
+                        (c.endpoint && c.endpoint.toLowerCase().includes(searchTerm)) ||
+                        (c.note && c.note.toLowerCase().includes(searchTerm));
+
+                    if (!matchesSearch) return false;
+
+                    // Status filter
+                    switch (currentFilter) {
+                        case 'connected': return c.connected;
+                        case 'offline': return !c.connected;
+                        case 'recent':
+                            // Seen in last 24h
+                            if (c.connected) return true;
+                            if (!c.last_seen) return false;
+                            const lastSeen = new Date(c.last_seen);
+                            const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+                            return lastSeen > dayAgo;
+                        default: return true;
+                    }
+                });
+
+                // Sort
+                filtered.sort((a, b) => {
+                    switch (sortBy) {
+                        case 'handshake':
+                            const aHs = a.handshake_seconds ?? Infinity;
+                            const bHs = b.handshake_seconds ?? Infinity;
+                            return aHs - bHs;
+                        case 'rx':
+                            return (b.transfer_rx || 0) - (a.transfer_rx || 0);
+                        case 'tx':
+                            return (b.transfer_tx || 0) - (a.transfer_tx || 0);
+                        default: // name
+                            return a.name.localeCompare(b.name);
+                    }
+                });
+
+                renderClients(filtered);
+            }
+
+            // ===== Sparkline Generator =====
             function generateSparkline(data) {
                 if (!data || data.length < 2) return '';
-                
+
                 const width = 50, height = 18, padding = 1;
                 const rxMax = Math.max(...data.map(p => p.rx || 0), 1);
                 const txMax = Math.max(...data.map(p => p.tx || 0), 1);
                 const yMax = Math.max(rxMax, txMax);
-                
+
                 const xStep = (width - padding * 2) / Math.max(data.length - 1, 1);
-                
+
                 function toPath(key) {
                     return data.map((p, i) => {
                         const x = padding + i * xStep;
@@ -1266,112 +2079,14 @@ TEMPLATE = '''
                         return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
                     }).join(' ');
                 }
-                
+
                 return `<span class="sparkline"><svg viewBox="0 0 ${width} ${height}">
                     <path class="rx" d="${toPath('rx')}"/>
                     <path class="tx" d="${toPath('tx')}"/>
                 </svg></span>`;
             }
-            
-            // Dashboard refresh
-            function refreshDashboard() {
-                fetch('/api/status')
-                    .then(r => r.json())
-                    .then(data => {
-                        // Stats
-                        document.getElementById('stats-grid').innerHTML = `
-                            <div class="stat-box">
-                                <div class="number">${data.stats.total_clients}</div>
-                                <div class="label">Total Clients</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="number">${data.stats.connected_clients}</div>
-                                <div class="label">Connected</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="number">${data.stats.total_rx_fmt}</div>
-                                <div class="label">↓ Total Recv</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="number">${data.stats.total_tx_fmt}</div>
-                                <div class="label">↑ Total Sent</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="number">${data.stats.uptime}</div>
-                                <div class="label">Uptime</div>
-                            </div>
-                            <div class="stat-box ${data.stats.wg_status !== 'active' ? 'warning' : ''}">
-                                <div class="number">${data.stats.wg_status}</div>
-                                <div class="label">WireGuard</div>
-                            </div>
-                        `;
-                        
-                        // Clients
-                        if (data.clients.length === 0) {
-                            document.getElementById('client-grid').innerHTML = 
-                                '<div class="empty-state">No clients configured yet</div>';
-                        } else {
-                            document.getElementById('client-grid').innerHTML = data.clients.map(c => {
-                                // Calculate live speeds from bandwidth history
-                                let rxSpeed = '0 B/s', txSpeed = '0 B/s';
-                                if (c.bandwidth_history && c.bandwidth_history.length >= 2) {
-                                    const recent = c.bandwidth_history.slice(-3);
-                                    const avgRx = recent.reduce((a, b) => a + (b.rx || 0), 0) / recent.length;
-                                    const avgTx = recent.reduce((a, b) => a + (b.tx || 0), 0) / recent.length;
-                                    // Convert to per-second (samples are ~5 sec apart)
-                                    rxSpeed = formatSpeed(avgRx / 5);
-                                    txSpeed = formatSpeed(avgTx / 5);
-                                }
-                                
-                                return `
-                                <div class="client-card">
-                                    <div class="status-indicator">
-                                        <div class="status-dot ${c.connected ? 'connected' : ''}" 
-                                             title="${c.connected ? 'Connected' : 'Offline'}"></div>
-                                    </div>
-                                    <div class="client-info">
-                                        <h3>
-                                            ${c.name}
-                                            ${c.note ? `<span class="note-badge">${c.note}</span>` : ''}
-                                        </h3>
-                                        <div class="client-meta">
-                                            <span>📍 ${c.ip}</span>
-                                            ${c.geo ? `<span><img class="geo-flag" src="https://flagcdn.com/w20/${c.geo.country_code}.png" alt="${c.geo.country}" onerror="this.style.display='none'"> ${c.geo.city || c.geo.country}</span>` : ''}
-                                            ${c.connected && c.endpoint ? `<span>🌐 ${c.endpoint}</span>` : ''}
-                                            ${c.connected && c.connection_duration_fmt ? `<span>🤝 Connected ${c.connection_duration_fmt}</span>` : ''}
-                                            ${c.connected ? `<span>↓${c.transfer_rx_fmt} ↑${c.transfer_tx_fmt} total</span>` : ''}
-                                        </div>
-                                        ${c.connected && c.bandwidth_history && c.bandwidth_history.length > 1 ? `
-                                        <div class="live-speed">
-                                            ${generateSparkline(c.bandwidth_history)}
-                                            <span class="rx-speed">↓${rxSpeed}</span>
-                                            <span class="tx-speed">↑${txSpeed}</span>
-                                        </div>
-                                        ` : ''}
-                                        ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen: ${c.last_seen}</div>` : ''}
-                                    </div>
-                                    <div class="client-actions">
-                                        <button class="btn btn-secondary btn-small" onclick="showQR('${c.name}')">QR</button>
-                                        <button class="btn btn-secondary btn-small" onclick="showConfig('${c.name}')">Config</button>
-                                        <a href="/download/${c.name}" class="btn btn-secondary btn-small">↓</a>
-                                        <button class="btn btn-secondary btn-small" onclick="showNote('${c.name}', '${(c.note || '').replace(/'/g, "\\'")}')">✎</button>
-                                        <button class="btn btn-danger btn-small" onclick="confirmRevoke('${c.name}')">Revoke</button>
-                                    </div>
-                                </div>
-                            `}).join('');
-                        }
-                        
-                        // Update map with client locations
-                        updateMap(data.clients);
-                    })
-                    .catch(err => console.error('Refresh failed:', err));
-            }
-            
-            // Initial load and auto-refresh
-            refreshDashboard();
-            setInterval(refreshDashboard, 5000);
-            
-            // Format bytes per second to human readable
+
+            // ===== Format Helpers =====
             function formatSpeed(bytesPerSec) {
                 if (bytesPerSec < 1) return '0 B/s';
                 const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s'];
@@ -1382,117 +2097,266 @@ TEMPLATE = '''
                 }
                 return bytesPerSec.toFixed(1) + ' ' + units[i];
             }
-            
-            // Map initialization
+
+            function formatHandshake(seconds) {
+                if (seconds === null || seconds === undefined) return null;
+                if (seconds < 60) return `${seconds}s ago`;
+                if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+                if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+                return `${Math.floor(seconds / 86400)}d ago`;
+            }
+
+            // ===== Render Clients =====
+            function renderClients(clients) {
+                const grid = document.getElementById('client-grid');
+
+                if (clients.length === 0) {
+                    grid.innerHTML = '<div class="empty-state">No clients match the current filter</div>';
+                    return;
+                }
+
+                grid.innerHTML = clients.map(c => {
+                    // Calculate live speeds from bandwidth history
+                    let rxSpeed = '0 B/s', txSpeed = '0 B/s';
+                    if (c.bandwidth_history && c.bandwidth_history.length >= 2) {
+                        const recent = c.bandwidth_history.slice(-3);
+                        const avgRx = recent.reduce((a, b) => a + (b.rx || 0), 0) / recent.length;
+                        const avgTx = recent.reduce((a, b) => a + (b.tx || 0), 0) / recent.length;
+                        rxSpeed = formatSpeed(avgRx / 5);
+                        txSpeed = formatSpeed(avgTx / 5);
+                    }
+
+                    // Apply demo mode redaction
+                    const displayIP = demoMode ? redactVPNIP(c.ip) : c.ip;
+                    const displayEndpoint = demoMode ? redactIP(c.endpoint) : c.endpoint;
+                    const displayGeo = demoMode ? redactLocation(c.geo) : c.geo;
+                    const displayLastEndpoint = demoMode ? redactIP(c.last_endpoint) : c.last_endpoint;
+
+                    // Handshake badge
+                    const handshakeDisplay = formatHandshake(c.handshake_seconds);
+                    const handshakeStale = c.handshake_seconds && c.handshake_seconds > 120;
+
+                    return `
+                    <div class="client-card" data-name="${c.name}" data-connected="${c.connected}">
+                        <div class="status-indicator">
+                            <div class="status-dot ${c.connected ? 'connected' : ''}"
+                                 title="${c.connected ? 'Connected' : 'Offline'}"></div>
+                        </div>
+                        <div class="client-info">
+                            <h3>
+                                ${c.name}
+                                ${c.note ? `<span class="note-badge">${c.note}</span>` : ''}
+                                ${handshakeDisplay ? `<span class="handshake-badge ${handshakeStale ? 'stale' : ''}">${handshakeDisplay}</span>` : ''}
+                            </h3>
+                            <div class="client-meta">
+                                <span>📍 ${displayIP}</span>
+                                ${displayGeo ? `<span><img class="geo-flag" src="https://flagcdn.com/w20/${displayGeo.country_code}.png" alt="${displayGeo.country}" onerror="this.style.display='none'"> ${displayGeo.city || displayGeo.country}</span>` : ''}
+                                ${c.connected && displayEndpoint ? `<span>🌐 ${displayEndpoint}<button class="copy-btn" onclick="event.stopPropagation();copyToClipboard('${c.endpoint}')" title="Copy">📋</button></span>` : ''}
+                                ${c.connected && c.connection_duration_fmt ? `<span>⏱️ ${c.connection_duration_fmt}</span>` : ''}
+                                ${c.connected ? `<span>↓${c.transfer_rx_fmt} ↑${c.transfer_tx_fmt}</span>` : ''}
+                            </div>
+                            ${c.connected && c.bandwidth_history && c.bandwidth_history.length > 1 ? `
+                            <div class="live-speed">
+                                ${generateSparkline(c.bandwidth_history)}
+                                <span class="rx-speed">↓${rxSpeed}</span>
+                                <span class="tx-speed">↑${txSpeed}</span>
+                            </div>
+                            ` : ''}
+                            ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen: ${c.last_seen}${displayLastEndpoint ? ' from ' + displayLastEndpoint : ''}</div>` : ''}
+                        </div>
+                        <div class="client-actions">
+                            <button class="icon-btn" onclick="showQR('${c.name}')" title="QR Code">📱</button>
+                            <button class="icon-btn" onclick="showConfig('${c.name}')" title="Config">📄</button>
+                            <a href="/download/${c.name}" class="icon-btn" title="Download">⬇️</a>
+                            <button class="icon-btn" onclick="showNote('${c.name}', '${(c.note || '').replace(/'/g, "\\'")}')" title="Edit Note">✏️</button>
+                            <button class="icon-btn danger" onclick="confirmRevoke('${c.name}')" title="Revoke">🗑️</button>
+                        </div>
+                    </div>
+                `}).join('');
+            }
+
+            // ===== Stats Display =====
+            let currentStats = null;
+
+            function updateStatsDisplay() {
+                if (!currentStats) return;
+                const s = currentStats;
+                const t = s.traffic || {};
+
+                const rxDisplay = trafficTimeWindow === '1h' ? (t.last1h_rx_fmt || '0 B') : (t.last24h_rx_fmt || '0 B');
+                const txDisplay = trafficTimeWindow === '1h' ? (t.last1h_tx_fmt || '0 B') : (t.last24h_tx_fmt || '0 B');
+
+                document.getElementById('stats-grid').innerHTML = `
+                    <div class="stat-box">
+                        <div class="number">${s.total_clients}</div>
+                        <div class="label">Total Clients</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="number">${s.connected_clients}</div>
+                        <div class="label">Connected</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="number">${rxDisplay}</div>
+                        <div class="label">↓ Received</div>
+                        <div class="stat-toggle">
+                            <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
+                            <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
+                        </div>
+                        <div class="stat-total">Total: ${s.total_rx_fmt}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="number">${txDisplay}</div>
+                        <div class="label">↑ Sent</div>
+                        <div class="stat-toggle">
+                            <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
+                            <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
+                        </div>
+                        <div class="stat-total">Total: ${s.total_tx_fmt}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="number">${s.uptime}</div>
+                        <div class="label">Uptime</div>
+                    </div>
+                `;
+            }
+
+            // ===== Dashboard Refresh =====
+            function refreshDashboard() {
+                fetch('/api/status')
+                    .then(r => r.json())
+                    .then(data => {
+                        currentStats = data.stats;
+                        allClients = data.clients;
+
+                        // Update stats
+                        updateStatsDisplay();
+
+                        // Update clients
+                        filterAndSortClients();
+
+                        // Update map
+                        updateMap(data.clients);
+
+                        // Update map client count
+                        const geoCount = data.clients.filter(c => c.geo && c.geo.lat).length;
+                        const connectedGeo = data.clients.filter(c => c.connected && c.geo && c.geo.lat).length;
+                        document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
+                    })
+                    .catch(err => console.error('Refresh failed:', err));
+            }
+
+            // ===== Map =====
             let clientMap = null;
             let mapMarkers = [];
             let lastUserInteraction = 0;
-            let mapInitialized = false;
-            const MAP_INTERACTION_TIMEOUT = 60000; // 60 seconds
-            
+            let mapInitializedOnce = false;
+            const MAP_INTERACTION_TIMEOUT = 60000;
+
             function initMap() {
                 if (clientMap) return;
-                
-                // Dark themed map tiles
+
+                const mapContainer = document.getElementById('client-map');
+                if (!mapContainer || !mapContainer.offsetParent) {
+                    // Map container not visible, skip initialization
+                    return;
+                }
+
                 const darkTiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
                     subdomains: 'abcd',
                     maxZoom: 19
                 });
-                
+
                 clientMap = L.map('client-map', {
-                    center: [39.0, -77.5],  // Default: roughly US East Coast
+                    center: [39.0, -77.5],
                     zoom: 4,
                     layers: [darkTiles],
                     zoomControl: true,
                     attributionControl: true
                 });
-                
-                // Track user interactions
-                clientMap.on('zoomstart', function() {
-                    lastUserInteraction = Date.now();
-                });
-                clientMap.on('dragstart', function() {
-                    lastUserInteraction = Date.now();
-                });
-                
-                // Style attribution
-                document.querySelector('.leaflet-control-attribution').style.cssText = 
-                    'background: rgba(37,37,66,0.8) !important; color: #888 !important; font-size: 10px;';
+
+                clientMap.on('zoomstart', () => { lastUserInteraction = Date.now(); });
+                clientMap.on('dragstart', () => { lastUserInteraction = Date.now(); });
+
+                setTimeout(() => {
+                    const attr = document.querySelector('.leaflet-control-attribution');
+                    if (attr) {
+                        attr.style.cssText = 'background: rgba(37,37,66,0.8) !important; color: #888 !important; font-size: 10px;';
+                    }
+                }, 100);
             }
-            
+
             function updateMap(clients) {
+                // Only initialize map if expanded
+                if (!mapExpanded) return;
+
                 if (!clientMap) {
                     initMap();
+                    if (!clientMap) return;
                 }
-                
+
                 // Clear existing markers
                 mapMarkers.forEach(m => clientMap.removeLayer(m));
                 mapMarkers = [];
-                
+
                 // Filter clients with geo data
-                const geoClients = clients.filter(c => c.geo && c.geo.lat && c.geo.lon);
-                
-                if (geoClients.length === 0) {
-                    // No geo data, show empty state
-                    return;
-                }
-                
-                // Add markers
+                let geoClients = clients.filter(c => c.geo && c.geo.lat && c.geo.lon);
+
+                if (geoClients.length === 0) return;
+
                 const bounds = [];
                 geoClients.forEach(client => {
                     const pos = [client.geo.lat, client.geo.lon];
                     bounds.push(pos);
-                    
-                    // Custom icon color based on connection status
+
                     const color = client.connected ? '#00d4aa' : '#666';
                     const glowColor = client.connected ? 'rgba(0,212,170,0.4)' : 'transparent';
-                    
+
                     const icon = L.divIcon({
                         className: 'custom-marker',
-                        html: `<div style="
-                            width: 16px;
-                            height: 16px;
-                            background: ${color};
-                            border: 2px solid white;
-                            border-radius: 50%;
-                            box-shadow: 0 0 10px ${glowColor}, 0 2px 6px rgba(0,0,0,0.3);
-                        "></div>`,
+                        html: `<div style="width:16px;height:16px;background:${color};border:2px solid white;border-radius:50%;box-shadow:0 0 10px ${glowColor}, 0 2px 6px rgba(0,0,0,0.3);"></div>`,
                         iconSize: [16, 16],
                         iconAnchor: [8, 8]
                     });
-                    
-                    const marker = L.marker(pos, { icon: icon }).addTo(clientMap);
-                    
-                    // Popup content
+
+                    const marker = L.marker(pos, { icon }).addTo(clientMap);
+
+                    // Apply demo mode redaction to popup
+                    const displayGeo = demoMode ? redactLocation(client.geo) : client.geo;
                     const popupContent = `
                         <div class="map-popup-title">${client.name}</div>
                         <div class="map-popup-info">
-                            ${client.geo.city ? client.geo.city + ', ' : ''}${client.geo.country}<br>
+                            ${displayGeo.city ? displayGeo.city + ', ' : ''}${displayGeo.country}<br>
                             ${client.connected ? '🟢 Connected' : '⚫ Offline'}
                             ${client.connected && client.connection_duration_fmt ? ' • ' + client.connection_duration_fmt : ''}
                         </div>
                     `;
                     marker.bindPopup(popupContent);
-                    
                     mapMarkers.push(marker);
                 });
-                
-                // Only auto-fit bounds if:
-                // 1. Map hasn't been initialized yet, OR
-                // 2. User hasn't interacted in the last 60 seconds
+
                 const timeSinceInteraction = Date.now() - lastUserInteraction;
-                const shouldAutoFit = !mapInitialized || timeSinceInteraction > MAP_INTERACTION_TIMEOUT;
-                
+                const shouldAutoFit = !mapInitializedOnce || timeSinceInteraction > MAP_INTERACTION_TIMEOUT;
+
                 if (bounds.length > 0 && shouldAutoFit) {
                     if (bounds.length === 1) {
                         clientMap.setView(bounds[0], 10);
                     } else {
                         clientMap.fitBounds(bounds, { padding: [30, 30], maxZoom: 12 });
                     }
-                    mapInitialized = true;
+                    mapInitializedOnce = true;
                 }
             }
+
+            // ===== Initial Load =====
+            refreshDashboard();
+            fetchHealth();
+            updateActivityStrip();
+
+            // Auto-refresh intervals
+            setInterval(refreshDashboard, 5000);
+            setInterval(fetchHealth, 30000);
+            setInterval(updateActivityStrip, 15000);
         </script>
         {% endif %}
     </div>
@@ -1534,6 +2398,11 @@ def api_status():
 @login_required
 def api_history():
     return jsonify(get_connection_history())
+
+@app.route('/api/health')
+@login_required
+def api_health():
+    return jsonify(get_health_status())
 
 @app.route('/api/note', methods=['POST'])
 @login_required
@@ -1597,5 +2466,5 @@ if __name__ == '__main__':
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"WireGuard Panel v3 starting on port {port}")
+    print(f"WireGuard Panel v4 starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
