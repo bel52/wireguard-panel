@@ -29,6 +29,7 @@ A lightweight, self-hosted WireGuard VPN management solution with both CLI and w
 - **Health & Risk Monitoring** — system health card showing WireGuard interface, IP forwarding, and NAT status
 - **Persistent Traffic Stats** — 1h/24h traffic windows survive restarts (stored in SQLite)
 - **Daily Usage Tracking** — per-client daily usage stats for historical reporting
+- **Parental Controls (Pause/Unpause)** — block internet for specific clients while keeping VPN connected (great for kids!)
 - **Demo-safe Mode** — one-click redaction of all sensitive IPs and locations for presentations
 - **Collapsible Map** — map collapsed by default, state persists in localStorage
 - **Enhanced Client Controls** — search, filter (All/Connected/Offline/Last 24h), and sort (Name/Handshake/RX/TX)
