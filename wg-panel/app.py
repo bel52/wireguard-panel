@@ -47,7 +47,9 @@ DNS_CHECK_ENABLED = os.environ.get('WG_PANEL_DNS_CHECK', '').lower() in ('1', 't
 DNS_CHECK_SERVER = os.environ.get('WG_PANEL_DNS_SERVER', '10.6.0.1')
 GEOIP_CACHE = {}
 BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
-CONNECTION_THRESHOLD_SECONDS = 300  # 5 minutes
+CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
+DISCONNECT_GRACE_SECONDS = 120  # Wait 2 minutes before logging disconnect
+PENDING_DISCONNECTS = {}  # Track pending disconnects: {name: first_seen_disconnected_time}
 
 # Traffic ring buffer for 1h/24h stats (stores samples with timestamps)
 # Each sample: {'timestamp': epoch, 'rx': bytes, 'tx': bytes}
@@ -220,20 +222,33 @@ def format_duration(seconds):
         return f"{secs}s"
 
 def get_geoip(ip):
-    if not ip or ip.startswith('10.') or ip.startswith('192.168.') or ip.startswith('172.'):
+    if not ip:
         return None
-    
-    ip = ip.split(':')[0]
-    
-    if ip in GEOIP_CACHE:
-        cached = GEOIP_CACHE[ip]
+
+    # Extract IP without port
+    check_ip = ip.split(':')[0]
+
+    # Skip private IP ranges
+    if check_ip.startswith('10.') or check_ip.startswith('192.168.'):
+        return None
+
+    # 172.16.0.0 - 172.31.255.255 is private (172.16-31.x.x)
+    if check_ip.startswith('172.'):
+        parts = check_ip.split('.')
+        if len(parts) >= 2:
+            second_octet = int(parts[1])
+            if 16 <= second_octet <= 31:
+                return None
+
+    if check_ip in GEOIP_CACHE:
+        cached = GEOIP_CACHE[check_ip]
         # Cache for 1 hour
         if cached.get('_time', 0) > time.time() - 3600:
             return cached
     
     try:
         import urllib.request
-        url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,lat,lon"
+        url = f"http://ip-api.com/json/{check_ip}?fields=status,country,countryCode,city,isp,lat,lon"
         with urllib.request.urlopen(url, timeout=2) as resp:
             data = json.loads(resp.read().decode())
             if data.get('status') == 'success':
@@ -246,7 +261,7 @@ def get_geoip(ip):
                     'lon': data.get('lon'),
                     '_time': time.time()
                 }
-                GEOIP_CACHE[ip] = result
+                GEOIP_CACHE[check_ip] = result
                 return result
     except:
         pass
@@ -754,6 +769,10 @@ def get_clients():
                 endpoint = live.get('endpoint', '')
                 
                 if is_connected:
+                    # Clear any pending disconnect since they're active
+                    if name in PENDING_DISCONNECTS:
+                        del PENDING_DISCONNECTS[name]
+
                     if session_row and session_row['is_connected']:
                         # Still connected — keep existing session_start
                         session_start = session_row['session_start']
@@ -761,12 +780,12 @@ def get_clients():
                         # Newly connected — start new session
                         session_start = now.isoformat()
                         log_connection_event(name, 'connected', endpoint)
-                    
+
                     conn.execute('''
                         INSERT OR REPLACE INTO client_sessions (name, session_start, last_seen, last_endpoint, is_connected)
                         VALUES (?, ?, ?, ?, 1)
                     ''', (name, session_start, now.isoformat(), endpoint))
-                    
+
                     # Calculate connection duration
                     try:
                         start_dt = datetime.fromisoformat(session_start)
@@ -774,17 +793,41 @@ def get_clients():
                     except:
                         connection_duration = 0
                 else:
-                    # Not connected
+                    # Not connected (based on handshake threshold)
+                    in_grace_period = False
                     if session_row and session_row['is_connected']:
-                        # Just disconnected — log it
-                        log_connection_event(name, 'disconnected', session_row['last_endpoint'] or '')
-                    
-                    if session_row:
+                        # Check grace period before logging disconnect
+                        now_ts = time.time()
+                        if name not in PENDING_DISCONNECTS:
+                            # Start grace period - still show as connected
+                            PENDING_DISCONNECTS[name] = now_ts
+                            in_grace_period = True
+                        elif now_ts - PENDING_DISCONNECTS[name] >= DISCONNECT_GRACE_SECONDS:
+                            # Grace period expired, actually log disconnect and update DB
+                            log_connection_event(name, 'disconnected', session_row['last_endpoint'] or '')
+                            del PENDING_DISCONNECTS[name]
+                            conn.execute('''
+                                UPDATE client_sessions SET is_connected = 0 WHERE name = ?
+                            ''', (name,))
+                        else:
+                            # Still in grace period, keep showing as connected
+                            in_grace_period = True
+                    elif session_row:
+                        # Was already disconnected, just ensure DB is updated
                         conn.execute('''
                             UPDATE client_sessions SET is_connected = 0 WHERE name = ?
                         ''', (name,))
-                    
-                    connection_duration = None
+
+                    # During grace period, keep showing as connected with duration
+                    if in_grace_period and session_row:
+                        is_connected = True  # Override for display
+                        try:
+                            start_dt = datetime.fromisoformat(session_row['session_start'])
+                            connection_duration = (now - start_dt).total_seconds()
+                        except:
+                            connection_duration = 0
+                    else:
+                        connection_duration = None
                 
                 conn.commit()
                 
@@ -2249,7 +2292,7 @@ TEMPLATE = '''
             }
 
             // ===== Activity Section =====
-            function formatTimeAgo(timestamp) {
+            function formatTimeAgo(timestamp, includeTime = false) {
                 if (!timestamp) return '';
                 const date = new Date(timestamp.replace(' ', 'T'));
                 const now = new Date();
@@ -2259,7 +2302,10 @@ TEMPLATE = '''
                 const diffHour = Math.floor(diffMin / 60);
                 const diffDay = Math.floor(diffHour / 24);
 
-                if (diffSec < 60) return 'just now';
+                // Format actual time for display
+                const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+                if (diffSec < 60) return includeTime ? timeStr : 'just now';
                 if (diffMin < 60) return `${diffMin}m ago`;
                 if (diffHour < 24) return `${diffHour}h ago`;
                 if (diffDay === 1) return 'yesterday';
@@ -2309,7 +2355,9 @@ TEMPLATE = '''
                         // Show last 15 events
                         list.innerHTML = data.slice(0, 15).map(h => {
                             const endpoint = demoMode ? redactIP(h.endpoint) : h.endpoint;
-                            const timeAgo = formatTimeAgo(h.timestamp);
+                            const timeAgo = formatTimeAgo(h.timestamp, true);  // Show actual time for recent events
+                            const date = new Date(h.timestamp.replace(' ', 'T'));
+                            const fullTime = date.toLocaleString();
                             return `
                                 <div class="activity-row">
                                     <div class="activity-icon ${h.event_type}">
@@ -2322,7 +2370,7 @@ TEMPLATE = '''
                                         </div>
                                         ${endpoint ? `<div class="activity-endpoint">from ${endpoint}</div>` : ''}
                                     </div>
-                                    <div class="activity-time">${timeAgo}</div>
+                                    <div class="activity-time" title="${fullTime}">${timeAgo}</div>
                                 </div>
                             `;
                         }).join('');
@@ -2657,7 +2705,7 @@ TEMPLATE = '''
                             <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
                             <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
                         </div>
-                        <div class="stat-total">Total: ${s.total_tx_fmt}</div>
+                        <div class="stat-total" title="Cumulative since WireGuard started">All time: ${s.total_tx_fmt}</div>
                     </div>
                     <div class="stat-box">
                         <div class="number">${rxDisplay}</div>
@@ -2666,7 +2714,7 @@ TEMPLATE = '''
                             <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
                             <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
                         </div>
-                        <div class="stat-total">Total: ${s.total_rx_fmt}</div>
+                        <div class="stat-total" title="Cumulative since WireGuard started">All time: ${s.total_rx_fmt}</div>
                     </div>
                     <div class="stat-box">
                         <div class="number">${s.uptime}</div>
