@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="/opt/wg-panel"
+VENV_PIP="/opt/wg-panel/venv/bin/pip"
+SERVICE="wg-panel"
+LOG_DIR="/var/log"
+LOG_FILE="${LOG_DIR}/wg-panel-update-main.log"
+
+mkdir -p "$LOG_DIR"
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
+
+log "== START wg-panel update (main) =="
+
+# Ensure git trusts this repo (prevents 'dubious ownership' failures)
+git config --global --add safe.directory "$REPO_DIR" >/dev/null 2>&1 || true
+
+cd "$REPO_DIR"
+
+log "== Repo status BEFORE =="
+git status -sb | tee -a "$LOG_FILE"
+
+log "== Fetch =="
+git fetch --all --prune | tee -a "$LOG_FILE"
+
+# Ensure we're on main
+current_branch="$(git branch --show-current || true)"
+if [ "$current_branch" != "main" ]; then
+  log "Switching branch: $current_branch -> main"
+  git checkout main | tee -a "$LOG_FILE"
+fi
+
+before="$(git rev-parse HEAD)"
+log "HEAD before: $before"
+
+log "== Pull (ff-only) =="
+# If already up-to-date, git returns 0 and prints message; that's fine.
+git pull --ff-only | tee -a "$LOG_FILE"
+
+after="$(git rev-parse HEAD)"
+log "HEAD after:  $after"
+
+changed="no"
+if [ "$before" != "$after" ]; then
+  changed="yes"
+  log "Code updated (new commits pulled)."
+else
+  log "No new commits."
+fi
+
+# Refresh entrypoint (matches your existing process)
+if [ -f "$REPO_DIR/wg-panel/app.py" ]; then
+  log "Refreshing entrypoint: $REPO_DIR/app.py <= $REPO_DIR/wg-panel/app.py"
+  cp -a "$REPO_DIR/wg-panel/app.py" "$REPO_DIR/app.py"
+else
+  log "WARN: $REPO_DIR/wg-panel/app.py not found; skipping entrypoint copy"
+fi
+
+# Refresh wg-tool if present
+if [ -f "$REPO_DIR/wg-tool" ]; then
+  log "Refreshing wg-tool: /usr/local/sbin/wg-tool"
+  cp -a "$REPO_DIR/wg-tool" /usr/local/sbin/wg-tool
+  chmod 755 /usr/local/sbin/wg-tool
+else
+  log "WARN: $REPO_DIR/wg-tool not found; skipping wg-tool refresh"
+fi
+
+# Install deps if requirements.txt exists
+if [ -x "$VENV_PIP" ]; then
+  if [ -f "$REPO_DIR/requirements.txt" ]; then
+    log "Installing deps: pip install -r requirements.txt"
+    "$VENV_PIP" install -q -r "$REPO_DIR/requirements.txt" | tee -a "$LOG_FILE"
+    changed="yes"  # deps might have changed even if code didn't (rare, but safe)
+  else
+    # Keep your prior behavior as a fallback
+    log "requirements.txt not found; ensuring flask is present"
+    "$VENV_PIP" install -q flask | tee -a "$LOG_FILE"
+  fi
+else
+  log "WARN: pip not found/executable at $VENV_PIP; skipping dependency install"
+fi
+
+if [ "$changed" = "yes" ]; then
+  log "== Restarting service: $SERVICE =="
+  systemctl restart "$SERVICE"
+else
+  log "== No changes detected; not restarting $SERVICE =="
+fi
+
+log "== Service status =="
+systemctl status "$SERVICE" --no-pager -l | tee -a "$LOG_FILE" || true
+
+log "== Listening check (5000) =="
+ss -ltnp | grep ':5000' | tee -a "$LOG_FILE" || true
+
+log "== END =="
