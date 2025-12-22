@@ -1985,8 +1985,8 @@ TEMPLATE = '''
                     <select class="sort-select" id="sortSelect" onchange="filterAndSortClients()">
                         <option value="name">Sort: Name</option>
                         <option value="handshake">Sort: Last Handshake</option>
-                        <option value="rx">Sort: Data Received</option>
-                        <option value="tx">Sort: Data Sent</option>
+                        <option value="tx">Sort: Downloaded</option>
+                        <option value="rx">Sort: Uploaded</option>
                     </select>
                 </div>
                 <div class="client-grid" id="client-grid">
@@ -2604,13 +2604,13 @@ TEMPLATE = '''
                                 ${displayGeo ? `<span><img class="geo-flag" src="https://flagcdn.com/w20/${displayGeo.country_code}.png" alt="${displayGeo.country}" onerror="this.style.display='none'"> ${displayGeo.city || displayGeo.country}</span>` : ''}
                                 ${c.connected && displayEndpoint ? `<span>🌐 ${displayEndpoint}<button class="copy-btn" onclick="event.stopPropagation();copyToClipboard('${c.endpoint}')" title="Copy">📋</button></span>` : ''}
                                 ${c.connected && c.connection_duration_fmt ? `<span>⏱️ ${c.connection_duration_fmt}</span>` : ''}
-                                ${c.connected ? `<span>↓${c.transfer_rx_fmt} ↑${c.transfer_tx_fmt}</span>` : ''}
+                                ${c.connected ? `<span>↓${c.transfer_tx_fmt} ↑${c.transfer_rx_fmt}</span>` : ''}
                             </div>
                             ${c.connected && c.bandwidth_history && c.bandwidth_history.length > 1 ? `
                             <div class="live-speed">
                                 ${generateSparkline(c.bandwidth_history)}
-                                <span class="rx-speed">↓${rxSpeed}</span>
-                                <span class="tx-speed">↑${txSpeed}</span>
+                                <span class="tx-speed">↓${txSpeed}</span>
+                                <span class="rx-speed">↑${rxSpeed}</span>
                             </div>
                             ` : ''}
                             ${!c.connected && c.last_seen ? `<div class="last-seen">Last seen ${c.last_seen_friendly || formatTimeAgo(c.last_seen)}${displayLastEndpoint ? ' from ' + displayLastEndpoint : ''}</div>` : ''}
@@ -2651,22 +2651,22 @@ TEMPLATE = '''
                         <div class="label">Connected</div>
                     </div>
                     <div class="stat-box">
-                        <div class="number">${rxDisplay}</div>
-                        <div class="label">↓ Received</div>
-                        <div class="stat-toggle">
-                            <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
-                            <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
-                        </div>
-                        <div class="stat-total">Total: ${s.total_rx_fmt}</div>
-                    </div>
-                    <div class="stat-box">
                         <div class="number">${txDisplay}</div>
-                        <div class="label">↑ Sent</div>
+                        <div class="label">↓ Downloaded</div>
                         <div class="stat-toggle">
                             <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
                             <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
                         </div>
                         <div class="stat-total">Total: ${s.total_tx_fmt}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="number">${rxDisplay}</div>
+                        <div class="label">↑ Uploaded</div>
+                        <div class="stat-toggle">
+                            <button class="${trafficTimeWindow === '1h' ? 'active' : ''}" data-window="1h" onclick="setTrafficWindow('1h')">1h</button>
+                            <button class="${trafficTimeWindow === '24h' ? 'active' : ''}" data-window="24h" onclick="setTrafficWindow('24h')">24h</button>
+                        </div>
+                        <div class="stat-total">Total: ${s.total_rx_fmt}</div>
                     </div>
                     <div class="stat-box">
                         <div class="number">${s.uptime}</div>
