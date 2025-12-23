@@ -842,16 +842,34 @@ def get_clients():
                 
                 endpoint = live.get('endpoint', '')
                 
+                # Session continuity: only start NEW session if offline for 30+ minutes
+                SESSION_RESET_THRESHOLD = 1800  # 30 minutes
+
                 if is_connected:
                     # Clear any pending disconnect since they're active
                     if name in PENDING_DISCONNECTS:
                         del PENDING_DISCONNECTS[name]
 
-                    if session_row and session_row['is_connected']:
-                        # Still connected — keep existing session_start
-                        session_start = session_row['session_start']
+                    if session_row and session_row['session_start']:
+                        # Check if we should continue existing session or start new one
+                        try:
+                            last_seen_dt = datetime.fromisoformat(session_row['last_seen']) if session_row['last_seen'] else None
+                            time_since_last_seen = (now - last_seen_dt).total_seconds() if last_seen_dt else float('inf')
+                        except:
+                            time_since_last_seen = float('inf')
+
+                        if time_since_last_seen < SESSION_RESET_THRESHOLD:
+                            # Continue existing session
+                            session_start = session_row['session_start']
+                            # Only log reconnect if they were marked offline
+                            if not session_row['is_connected']:
+                                log_connection_event(name, 'connected', endpoint)
+                        else:
+                            # Been offline too long, start fresh session
+                            session_start = now.isoformat()
+                            log_connection_event(name, 'connected', endpoint)
                     else:
-                        # Newly connected — start new session
+                        # No existing session, start new one
                         session_start = now.isoformat()
                         log_connection_event(name, 'connected', endpoint)
 
@@ -870,14 +888,14 @@ def get_clients():
                     # Not connected (based on handshake threshold)
                     in_grace_period = False
                     if session_row and session_row['is_connected']:
-                        # Check grace period before logging disconnect
+                        # Check grace period before marking offline
                         now_ts = time.time()
                         if name not in PENDING_DISCONNECTS:
                             # Start grace period - still show as connected
                             PENDING_DISCONNECTS[name] = now_ts
                             in_grace_period = True
                         elif now_ts - PENDING_DISCONNECTS[name] >= DISCONNECT_GRACE_SECONDS:
-                            # Grace period expired, actually log disconnect and update DB
+                            # Grace period expired, mark offline (but keep session_start!)
                             log_connection_event(name, 'disconnected', session_row['last_endpoint'] or '')
                             del PENDING_DISCONNECTS[name]
                             conn.execute('''
@@ -887,13 +905,11 @@ def get_clients():
                             # Still in grace period, keep showing as connected
                             in_grace_period = True
                     elif session_row:
-                        # Was already disconnected, just ensure DB is updated
-                        conn.execute('''
-                            UPDATE client_sessions SET is_connected = 0 WHERE name = ?
-                        ''', (name,))
+                        # Was already disconnected
+                        pass  # Don't update, keep existing session_start for when they return
 
                     # During grace period, keep showing as connected with duration
-                    if in_grace_period and session_row:
+                    if in_grace_period and session_row and session_row['session_start']:
                         is_connected = True  # Override for display
                         try:
                             start_dt = datetime.fromisoformat(session_row['session_start'])
@@ -2384,21 +2400,37 @@ TEMPLATE = '''
             }
 
             // ===== Activity Section =====
-            function formatTimeAgo(timestamp, includeTime = false) {
+            function formatTimeAgo(timestamp, showActualTime = false) {
                 if (!timestamp) return '';
                 // Append 'Z' to indicate UTC, so browser converts to local time
                 const date = new Date(timestamp.replace(' ', 'T') + 'Z');
                 const now = new Date();
                 const diffMs = now - date;
+                const diffDay = Math.floor(diffMs / (24 * 60 * 60 * 1000));
+
+                // Format actual time for display
+                const timeStr = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+                // If showActualTime is true, always show the actual timestamp
+                if (showActualTime) {
+                    if (diffDay === 0) {
+                        return timeStr;  // Today: "10:31 PM"
+                    } else if (diffDay === 1) {
+                        return `Yesterday ${timeStr}`;
+                    } else if (diffDay < 7) {
+                        const dayName = date.toLocaleDateString([], { weekday: 'short' });
+                        return `${dayName} ${timeStr}`;  // "Mon 10:31 PM"
+                    } else {
+                        return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + timeStr;
+                    }
+                }
+
+                // Relative time for other uses
                 const diffSec = Math.floor(diffMs / 1000);
                 const diffMin = Math.floor(diffSec / 60);
                 const diffHour = Math.floor(diffMin / 60);
-                const diffDay = Math.floor(diffHour / 24);
 
-                // Format actual time for display
-                const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-                if (diffSec < 60) return includeTime ? timeStr : 'just now';
+                if (diffSec < 60) return 'just now';
                 if (diffMin < 60) return `${diffMin}m ago`;
                 if (diffHour < 24) return `${diffHour}h ago`;
                 if (diffDay === 1) return 'yesterday';
