@@ -27,6 +27,7 @@ import sqlite3
 import json
 import time
 import threading
+import logging
 from collections import deque
 from functools import wraps
 from datetime import datetime, timedelta
@@ -34,9 +35,22 @@ from pathlib import Path
 
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, Response, jsonify
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('leathguard')
+
 app = Flask(__name__)
 app.secret_key = os.environ.get('WG_PANEL_SECRET', secrets.token_hex(32))
 app.permanent_session_lifetime = timedelta(hours=8)
+
+# Session cookie security settings
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access to session cookie
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection for cookies
+# Note: SESSION_COOKIE_SECURE should be True in production with HTTPS
+# app.config['SESSION_COOKIE_SECURE'] = True
 
 # Config
 AUTH_USER = os.environ.get('WG_PANEL_USER', 'admin')
@@ -153,11 +167,69 @@ def cleanup_old_samples():
 
 # --------------- Auth ---------------
 
+# Rate limiting for login attempts: {ip: [(timestamp, ...], ...}
+LOGIN_ATTEMPTS = {}
+LOGIN_RATE_LIMIT = 5  # Max attempts
+LOGIN_RATE_WINDOW = 300  # 5 minute window
+
 def check_password(password):
+    """Check password with constant-time comparison to prevent timing attacks."""
+    import hashlib
     if AUTH_PASS_HASH:
-        import hashlib
-        return hashlib.sha256(password.encode()).hexdigest() == AUTH_PASS_HASH
-    return password == AUTH_PASS_PLAIN
+        provided_hash = hashlib.sha256(password.encode()).hexdigest()
+        # Use constant-time comparison to prevent timing attacks
+        return secrets.compare_digest(provided_hash, AUTH_PASS_HASH)
+    # For plain password, also use constant-time comparison
+    return secrets.compare_digest(password, AUTH_PASS_PLAIN)
+
+def is_rate_limited(ip):
+    """Check if IP has exceeded login rate limit."""
+    now = time.time()
+    if ip in LOGIN_ATTEMPTS:
+        # Clean old attempts
+        LOGIN_ATTEMPTS[ip] = [t for t in LOGIN_ATTEMPTS[ip] if now - t < LOGIN_RATE_WINDOW]
+        if len(LOGIN_ATTEMPTS[ip]) >= LOGIN_RATE_LIMIT:
+            return True
+    return False
+
+def record_login_attempt(ip):
+    """Record a failed login attempt."""
+    now = time.time()
+    if ip not in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[ip] = []
+    LOGIN_ATTEMPTS[ip].append(now)
+
+def clear_login_attempts(ip):
+    """Clear login attempts after successful login."""
+    if ip in LOGIN_ATTEMPTS:
+        del LOGIN_ATTEMPTS[ip]
+
+def generate_csrf_token():
+    """Generate or retrieve CSRF token for the session."""
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(32)
+    return session['csrf_token']
+
+def validate_csrf_token(token):
+    """Validate CSRF token with constant-time comparison."""
+    expected = session.get('csrf_token', '')
+    if not expected or not token:
+        return False
+    return secrets.compare_digest(token, expected)
+
+def csrf_required(f):
+    """Decorator to require valid CSRF token on POST requests."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == 'POST':
+            token = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token')
+            if not validate_csrf_token(token):
+                if request.is_json or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                    return jsonify({'error': 'CSRF validation failed'}), 403
+                flash('Security validation failed. Please try again.')
+                return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated
 
 def login_required(f):
     @wraps(f)
@@ -263,9 +335,9 @@ def get_geoip(ip):
                 }
                 GEOIP_CACHE[check_ip] = result
                 return result
-    except:
-        pass
-    
+    except Exception as e:
+        logger.debug(f"GeoIP lookup failed for {check_ip}: {e}")
+
     return None
 
 def get_server_uptime():
@@ -405,8 +477,8 @@ def record_traffic_sample(total_rx, total_tx):
                     ''', (rx_delta, tx_delta))
                     conn.commit()
                     conn.close()
-                except:
-                    pass
+                except sqlite3.Error as e:
+                    logger.warning(f"Failed to record traffic sample: {e}")
 
         LAST_TRAFFIC_SAMPLE = {'rx': total_rx, 'tx': total_tx, 'time': now}
 
@@ -431,8 +503,8 @@ def load_traffic_from_db():
                     'rx': row['rx_delta'],
                     'tx': row['tx_delta']
                 })
-    except:
-        pass
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to load traffic from database: {e}")
 
 def cleanup_old_traffic_samples():
     """Remove traffic samples older than 24 hours from database."""
@@ -441,8 +513,8 @@ def cleanup_old_traffic_samples():
         conn.execute("DELETE FROM traffic_samples WHERE timestamp < datetime('now', '-24 hours')")
         conn.commit()
         conn.close()
-    except:
-        pass
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to cleanup old traffic samples: {e}")
 
 def get_traffic_windows():
     """Calculate traffic for last 1h and 24h windows from memory buffer."""
@@ -558,7 +630,8 @@ def is_client_paused(client_name):
         row = conn.execute('SELECT 1 FROM paused_clients WHERE name = ?', (client_name,)).fetchone()
         conn.close()
         return row is not None
-    except:
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to check pause status for {client_name}: {e}")
         return False
 
 def get_paused_clients():
@@ -568,7 +641,8 @@ def get_paused_clients():
         rows = conn.execute('SELECT name, paused_at FROM paused_clients').fetchall()
         conn.close()
         return {row['name']: row['paused_at'] for row in rows}
-    except:
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to get paused clients: {e}")
         return {}
 
 def pause_client(client_name):
@@ -1016,13 +1090,26 @@ def get_client_qr(name):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return None
     try:
-        result = subprocess.run(
-            f'sudo cat /etc/wireguard/clients/{name}.conf | qrencode -o - -t PNG',
-            shell=True, capture_output=True
+        # Read config file without shell=True to prevent command injection
+        conf_path = f'/etc/wireguard/clients/{name}.conf'
+        cat_result = subprocess.run(
+            ['sudo', 'cat', conf_path],
+            capture_output=True, timeout=10
         )
-        if result.returncode == 0:
-            return result.stdout
-    except:
+        if cat_result.returncode != 0:
+            return None
+
+        # Pipe to qrencode without shell
+        qr_result = subprocess.run(
+            ['qrencode', '-o', '-', '-t', 'PNG'],
+            input=cat_result.stdout,
+            capture_output=True, timeout=10
+        )
+        if qr_result.returncode == 0:
+            return qr_result.stdout
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
         pass
     return None
 
@@ -2068,9 +2155,10 @@ TEMPLATE = '''
             <div class="modal-content">
                 <h2>Add New Client</h2>
                 <form method="POST" action="{{ url_for('add') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="form-group">
                         <label>Client Name</label>
-                        <input type="text" name="name" pattern="[a-zA-Z0-9_-]+" 
+                        <input type="text" name="name" pattern="[a-zA-Z0-9_-]+"
                                placeholder="e.g., iphone, laptop" required>
                     </div>
                     <div class="form-group">
@@ -2140,6 +2228,7 @@ TEMPLATE = '''
                 <h2>Revoke Client</h2>
                 <p style="margin-bottom:15px;">Are you sure you want to revoke <strong id="revokeClientName"></strong>?</p>
                 <form method="POST" action="{{ url_for('revoke') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="name" id="revokeInput">
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" onclick="hideModals()">Cancel</button>
@@ -2150,6 +2239,9 @@ TEMPLATE = '''
         </div>
         
         <script>
+            // ===== CSRF Token =====
+            const CSRF_TOKEN = '{{ csrf_token() }}';
+
             // ===== State Management =====
             let allClients = [];
             let currentFilter = 'all';
@@ -2383,7 +2475,7 @@ TEMPLATE = '''
 
                 fetch('/api/pause', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
                 })
                 .then(r => r.json())
@@ -2400,7 +2492,7 @@ TEMPLATE = '''
             function unpauseClient(name) {
                 fetch('/api/unpause', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
                 })
                 .then(r => r.json())
@@ -2486,7 +2578,7 @@ TEMPLATE = '''
                 const note = document.getElementById('noteTextarea').value;
                 fetch('/api/note', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
                     body: JSON.stringify({name, note})
                 }).then(() => {
                     hideModals();
@@ -2893,6 +2985,14 @@ TEMPLATE = '''
 '''
 
 
+# --------------- Context Processor ---------------
+
+@app.context_processor
+def inject_csrf_token():
+    """Make CSRF token available in all templates."""
+    return {'csrf_token': generate_csrf_token}
+
+
 # --------------- Routes ---------------
 
 @app.route('/')
@@ -2902,10 +3002,22 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        client_ip = request.remote_addr or 'unknown'
+
+        # Check rate limit
+        if is_rate_limited(client_ip):
+            flash('Too many login attempts. Please wait 5 minutes.')
+            return redirect(url_for('index'))
+
         if request.form.get('username') == AUTH_USER and check_password(request.form.get('password', '')):
             session.permanent = True
             session['logged_in'] = True
+            clear_login_attempts(client_ip)
+            # Generate CSRF token for the session
+            generate_csrf_token()
             return redirect(url_for('index'))
+
+        record_login_attempt(client_ip)
         flash('Invalid credentials')
     return redirect(url_for('index'))
 
@@ -2934,6 +3046,7 @@ def api_health():
 
 @app.route('/api/note', methods=['POST'])
 @login_required
+@csrf_required
 def api_note():
     data = request.get_json()
     if data and 'name' in data:
@@ -2943,6 +3056,7 @@ def api_note():
 
 @app.route('/api/pause', methods=['POST'])
 @login_required
+@csrf_required
 def api_pause():
     data = request.get_json()
     if data and 'name' in data:
@@ -2954,6 +3068,7 @@ def api_pause():
 
 @app.route('/api/unpause', methods=['POST'])
 @login_required
+@csrf_required
 def api_unpause():
     data = request.get_json()
     if data and 'name' in data:
@@ -2965,6 +3080,7 @@ def api_unpause():
 
 @app.route('/add', methods=['POST'])
 @login_required
+@csrf_required
 def add():
     name = request.form.get('name', '').strip()
     note = request.form.get('note', '').strip()
@@ -2980,6 +3096,7 @@ def add():
 
 @app.route('/revoke', methods=['POST'])
 @login_required
+@csrf_required
 def revoke():
     name = request.form.get('name', '').strip()
     if name:
