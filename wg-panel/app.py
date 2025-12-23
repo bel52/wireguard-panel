@@ -2386,7 +2386,8 @@ TEMPLATE = '''
             // ===== Activity Section =====
             function formatTimeAgo(timestamp, includeTime = false) {
                 if (!timestamp) return '';
-                const date = new Date(timestamp.replace(' ', 'T'));
+                // Append 'Z' to indicate UTC, so browser converts to local time
+                const date = new Date(timestamp.replace(' ', 'T') + 'Z');
                 const now = new Date();
                 const diffMs = now - date;
                 const diffSec = Math.floor(diffMs / 1000);
@@ -2448,7 +2449,7 @@ TEMPLATE = '''
                         list.innerHTML = data.slice(0, 15).map(h => {
                             const endpoint = demoMode ? redactIP(h.endpoint) : h.endpoint;
                             const timeAgo = formatTimeAgo(h.timestamp, true);  // Show actual time for recent events
-                            const date = new Date(h.timestamp.replace(' ', 'T'));
+                            const date = new Date(h.timestamp.replace(' ', 'T') + 'Z');  // UTC to local
                             const fullTime = date.toLocaleString();
                             return `
                                 <div class="activity-row">
