@@ -52,6 +52,36 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection for cookies
 # Note: SESSION_COOKIE_SECURE should be True in production with HTTPS
 # app.config['SESSION_COOKIE_SECURE'] = True
 
+# App version for cache busting (update when making breaking changes)
+APP_VERSION = '4.0.1'
+
+@app.after_request
+def set_cache_headers(response):
+    """Set cache-control headers to prevent browser caching issues.
+
+    This fixes the issue where browsers (especially Safari) cache responses
+    aggressively, requiring users to clear website data to access the app.
+    """
+    # For API endpoints - never cache dynamic data
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    # For main page and auth routes - prevent stale HTML
+    elif request.path in ('/', '/login', '/logout'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    # For QR codes and configs - short cache, revalidate
+    elif request.path.startswith('/qr/') or request.path.startswith('/config/') or request.path.startswith('/download/'):
+        response.headers['Cache-Control'] = 'private, no-cache, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+
+    # Add version header for debugging cache issues
+    response.headers['X-App-Version'] = APP_VERSION
+
+    return response
+
 # Config
 AUTH_USER = os.environ.get('WG_PANEL_USER', 'admin')
 AUTH_PASS_HASH = os.environ.get('WG_PANEL_PASS_HASH', '')
@@ -1150,6 +1180,9 @@ TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>LeathGuard</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
@@ -2258,6 +2291,24 @@ TEMPLATE = '''
             // ===== CSRF Token =====
             const CSRF_TOKEN = '{{ csrf_token() }}';
 
+            // ===== Cache/Storage Version Management =====
+            // Prevents stale localStorage data from breaking the app
+            const APP_STORAGE_VERSION = '4.0.1';
+            const storedVersion = localStorage.getItem('appVersion');
+            if (storedVersion !== APP_STORAGE_VERSION) {
+                // Clear potentially stale settings on version change
+                console.log('App version changed, clearing localStorage cache');
+                const keysToPreserve = ['theme']; // Preserve user's theme preference
+                const preserved = {};
+                keysToPreserve.forEach(key => {
+                    const val = localStorage.getItem(key);
+                    if (val !== null) preserved[key] = val;
+                });
+                localStorage.clear();
+                Object.entries(preserved).forEach(([key, val]) => localStorage.setItem(key, val));
+                localStorage.setItem('appVersion', APP_STORAGE_VERSION);
+            }
+
             // ===== State Management =====
             let allClients = [];
             let currentFilter = 'all';
@@ -2390,7 +2441,8 @@ TEMPLATE = '''
             }
 
             function fetchHealth() {
-                fetch('/api/health')
+                // Add cache-busting timestamp to prevent browser caching
+                fetch('/api/health?_t=' + Date.now())
                     .then(r => r.json())
                     .then(updateHealthCard)
                     .catch(err => {
@@ -2463,7 +2515,8 @@ TEMPLATE = '''
             }
 
             function updateActivitySection() {
-                fetch('/api/history')
+                // Add cache-busting timestamp to prevent browser caching
+                fetch('/api/history?_t=' + Date.now())
                     .then(r => r.json())
                     .then(data => {
                         const list = document.getElementById('activityList');
@@ -2850,7 +2903,8 @@ TEMPLATE = '''
 
             // ===== Dashboard Refresh =====
             function refreshDashboard() {
-                fetch('/api/status')
+                // Add cache-busting timestamp to prevent browser caching
+                fetch('/api/status?_t=' + Date.now())
                     .then(r => {
                         if (!r.ok) throw new Error(`HTTP ${r.status}`);
                         return r.json();
