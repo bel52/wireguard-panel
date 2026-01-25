@@ -265,8 +265,18 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get('logged_in'):
-            if request.is_json or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-                return jsonify({'error': 'unauthorized'}), 401
+            # Detect API/AJAX requests that should get 401 instead of redirect
+            # This prevents fetch() from silently following redirects and failing
+            is_api_request = (
+                request.is_json or
+                request.headers.get('X-Requested-With') == 'XMLHttpRequest' or
+                request.path.startswith('/api/') or
+                request.path.startswith('/config/') or
+                request.path.startswith('/qr/') or
+                request.headers.get('Accept', '').startswith('application/json')
+            )
+            if is_api_request:
+                return jsonify({'error': 'unauthorized', 'redirect': '/login'}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -2346,6 +2356,71 @@ TEMPLATE = '''
             let trafficTimeWindow = '1h';
             let demoMode = localStorage.getItem('demoMode') === 'true';
             let mapExpanded = localStorage.getItem('mapExpanded') === 'true'; // Default to collapsed (false)
+            let sessionExpired = false;  // Track if session has expired to prevent spam
+
+            // ===== API Fetch Helper =====
+            // Centralized fetch handler that properly handles auth errors and redirects
+            function apiFetch(url, options = {}) {
+                return fetch(url, options)
+                    .then(response => {
+                        // Check for 401 Unauthorized - session expired
+                        if (response.status === 401) {
+                            if (!sessionExpired) {
+                                sessionExpired = true;
+                                console.warn('Session expired, redirecting to login');
+                                showSessionExpiredError();
+                            }
+                            throw new Error('Session expired');
+                        }
+                        // Check for redirect to login page (fallback detection)
+                        if (response.redirected && response.url.includes('/login')) {
+                            if (!sessionExpired) {
+                                sessionExpired = true;
+                                console.warn('Redirected to login, session may have expired');
+                                showSessionExpiredError();
+                            }
+                            throw new Error('Session expired');
+                        }
+                        // Check for other HTTP errors
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                        }
+                        return response;
+                    });
+            }
+
+            function showSessionExpiredError() {
+                // Show a clear error message instead of leaving UI stuck on "Loading..."
+                document.getElementById('stats-grid').innerHTML = `
+                    <div class="stat-box warning">
+                        <div class="number">!</div>
+                        <div class="label">Session Expired</div>
+                    </div>
+                `;
+                document.getElementById('client-grid').innerHTML = `
+                    <div class="empty-state">
+                        <p>Your session has expired.</p>
+                        <p><a href="/login" style="color:var(--accent-primary);">Click here to log in again</a></p>
+                    </div>
+                `;
+                // Also update activity section
+                const activityList = document.getElementById('activityList');
+                if (activityList) {
+                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Session expired - please log in</div>';
+                }
+            }
+
+            function showApiError(message) {
+                // Generic API error display
+                document.getElementById('stats-grid').innerHTML = `
+                    <div class="stat-box warning">
+                        <div class="number">!</div>
+                        <div class="label">API Error</div>
+                    </div>
+                `;
+                document.getElementById('client-grid').innerHTML =
+                    '<div class="empty-state">' + (message || 'Failed to load data. Check server connection.') + '</div>';
+            }
 
             // ===== Theme =====
             function toggleTheme() {
@@ -2473,10 +2548,11 @@ TEMPLATE = '''
 
             function fetchHealth() {
                 // Add cache-busting timestamp to prevent browser caching
-                fetch('/api/health?_t=' + Date.now())
+                apiFetch('/api/health?_t=' + Date.now())
                     .then(r => r.json())
                     .then(updateHealthCard)
                     .catch(err => {
+                        if (err.message === 'Session expired') return;  // Already handled
                         console.error('Health check failed:', err);
                         updateHealthCard({ overall: 'down', checks: [{ name: 'API', status: 'fail', detail: 'Unable to fetch health status' }] });
                     });
@@ -2547,7 +2623,7 @@ TEMPLATE = '''
 
             function updateActivitySection() {
                 // Add cache-busting timestamp to prevent browser caching
-                fetch('/api/history?_t=' + Date.now())
+                apiFetch('/api/history?_t=' + Date.now())
                     .then(r => r.json())
                     .then(data => {
                         const list = document.getElementById('activityList');
@@ -2583,6 +2659,14 @@ TEMPLATE = '''
                                 </div>
                             `;
                         }).join('');
+                    })
+                    .catch(err => {
+                        if (err.message === 'Session expired') return;  // Already handled
+                        console.error('Activity fetch failed:', err);
+                        const list = document.getElementById('activityList');
+                        if (list) {
+                            list.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Failed to load activity</div>';
+                        }
                     });
             }
 
@@ -2590,7 +2674,7 @@ TEMPLATE = '''
             function pauseClient(name) {
                 if (!confirm(`Pause internet for "${name}"? They will stay connected to VPN but cannot access the internet.`)) return;
 
-                fetch('/api/pause', {
+                apiFetch('/api/pause', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
@@ -2603,11 +2687,14 @@ TEMPLATE = '''
                         alert('Failed to pause: ' + (data.error || 'Unknown error'));
                     }
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch(err => {
+                    if (err.message === 'Session expired') return;  // Already handled
+                    alert('Error: ' + err);
+                });
             }
 
             function unpauseClient(name) {
-                fetch('/api/unpause', {
+                apiFetch('/api/unpause', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
@@ -2620,7 +2707,10 @@ TEMPLATE = '''
                         alert('Failed to unpause: ' + (data.error || 'Unknown error'));
                     }
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch(err => {
+                    if (err.message === 'Session expired') return;  // Already handled
+                    alert('Error: ' + err);
+                });
             }
 
             // ===== Modals =====
@@ -2632,11 +2722,16 @@ TEMPLATE = '''
             }
             function showConfig(name) {
                 document.getElementById('configClientName').textContent = name;
-                fetch('/config/' + name)
+                apiFetch('/config/' + encodeURIComponent(name))
                     .then(r => r.text())
                     .then(t => {
                         document.getElementById('configContent').textContent = t;
                         document.getElementById('configModal').classList.add('active');
+                    })
+                    .catch(err => {
+                        if (err.message === 'Session expired') return;  // Already handled
+                        console.error('Config fetch failed:', err);
+                        alert('Failed to load config: ' + err.message);
                     });
             }
             function showNote(name, currentNote) {
@@ -2646,7 +2741,7 @@ TEMPLATE = '''
                 document.getElementById('noteModal').classList.add('active');
             }
             function showHistoryModal() {
-                fetch('/api/history')
+                apiFetch('/api/history')
                     .then(r => r.json())
                     .then(data => {
                         const list = document.getElementById('historyList');
@@ -2663,6 +2758,15 @@ TEMPLATE = '''
                                     </div>
                                 `;
                             }).join('');
+                        }
+                        document.getElementById('historyModal').classList.add('active');
+                    })
+                    .catch(err => {
+                        if (err.message === 'Session expired') return;  // Already handled
+                        console.error('History fetch failed:', err);
+                        const list = document.getElementById('historyList');
+                        if (list) {
+                            list.innerHTML = '<div class="empty-state">Failed to load history</div>';
                         }
                         document.getElementById('historyModal').classList.add('active');
                     });
@@ -2694,13 +2798,24 @@ TEMPLATE = '''
                 e.preventDefault();
                 const name = document.getElementById('noteClientInput').value;
                 const note = document.getElementById('noteTextarea').value;
-                fetch('/api/note', {
+                apiFetch('/api/note', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
                     body: JSON.stringify({name, note})
-                }).then(() => {
-                    hideModals();
-                    refreshDashboard();
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok) {
+                        hideModals();
+                        refreshDashboard();
+                    } else {
+                        alert('Failed to save note: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;  // Already handled
+                    console.error('Note save failed:', err);
+                    alert('Failed to save note: ' + err.message);
                 });
             });
 
@@ -2935,12 +3050,12 @@ TEMPLATE = '''
 
             // ===== Dashboard Refresh =====
             function refreshDashboard() {
+                // Skip refresh if session has expired (prevents spam)
+                if (sessionExpired) return;
+
                 // Add cache-busting timestamp to prevent browser caching
-                fetch('/api/status?_t=' + Date.now())
-                    .then(r => {
-                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                        return r.json();
-                    })
+                apiFetch('/api/status?_t=' + Date.now())
+                    .then(r => r.json())
                     .then(data => {
                         currentStats = data.stats;
                         allClients = data.clients || [];
@@ -2961,6 +3076,7 @@ TEMPLATE = '''
                         document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
                     })
                     .catch(err => {
+                        if (err.message === 'Session expired') return;  // Already handled by apiFetch
                         console.error('Refresh failed:', err);
                         // Show error state in stats grid
                         document.getElementById('stats-grid').innerHTML = `
