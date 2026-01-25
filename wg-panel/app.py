@@ -43,7 +43,9 @@ logging.basicConfig(
 logger = logging.getLogger('leathguard')
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('WG_PANEL_SECRET', secrets.token_hex(32))
+# Secret key will be set properly after database initialization
+# to ensure persistence across restarts
+app.secret_key = 'temporary-key-replaced-on-init'
 app.permanent_session_lifetime = timedelta(hours=8)
 
 # Session cookie security settings
@@ -177,6 +179,13 @@ def init_db():
             paused_by TEXT DEFAULT 'admin'
         );
 
+        -- App settings for persistent configuration (e.g., secret key)
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_history_client ON connection_history(client_name);
         CREATE INDEX IF NOT EXISTS idx_history_time ON connection_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_bandwidth_client ON bandwidth_samples(client_name);
@@ -194,6 +203,48 @@ def cleanup_old_samples():
     conn.execute("DELETE FROM bandwidth_samples WHERE timestamp < datetime('now', '-2 minutes')")
     conn.commit()
     conn.close()
+
+
+def init_secret_key():
+    """Initialize Flask secret key with persistence.
+
+    Priority:
+    1. Environment variable WG_PANEL_SECRET (if set)
+    2. Stored in database (survives restarts)
+    3. Generate new and store in database
+
+    This ensures sessions survive service restarts.
+    """
+    # Check environment variable first (takes precedence)
+    env_secret = os.environ.get('WG_PANEL_SECRET')
+    if env_secret:
+        app.secret_key = env_secret
+        logger.info("Using secret key from environment variable")
+        return
+
+    # Try to load from database
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'secret_key'"
+        ).fetchone()
+
+        if row:
+            app.secret_key = row['value']
+            logger.info("Loaded secret key from database (sessions will persist)")
+        else:
+            # Generate new secret key and store it
+            new_key = secrets.token_hex(32)
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('secret_key', ?)",
+                (new_key,)
+            )
+            conn.commit()
+            app.secret_key = new_key
+            logger.info("Generated and stored new secret key in database")
+    finally:
+        conn.close()
+
 
 # --------------- Auth ---------------
 
@@ -3377,6 +3428,9 @@ if __name__ == '__main__':
     import sys
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
+
+    # Initialize secret key from database (ensures sessions survive restarts)
+    init_secret_key()
 
     # Load persistent traffic stats from database
     load_traffic_from_db()
