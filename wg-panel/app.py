@@ -1475,6 +1475,14 @@ TEMPLATE = '''
             padding: 3px 8px;
             border-radius: 6px;
         }
+        .client-info h3 .system-name-badge {
+            font-size: 0.7em;
+            font-weight: 500;
+            color: var(--text-secondary);
+            background: var(--bg-secondary);
+            padding: 3px 8px;
+            border-radius: 6px;
+        }
         .client-info h3 .paused-badge {
             font-size: 0.7em;
             font-weight: 600;
@@ -2967,9 +2975,9 @@ TEMPLATE = '''
                         </div>
                         <div class="client-info">
                             <h3>
-                                ${c.name}
+                                ${c.note || c.name}
+                                ${c.note ? `<span class="system-name-badge">${c.name}</span>` : ''}
                                 ${c.paused ? '<span class="paused-badge">⏸ PAUSED</span>' : ''}
-                                ${c.note ? `<span class="note-badge">${c.note}</span>` : ''}
                                 ${handshakeDisplay ? `<span class="handshake-badge ${handshakeStale ? 'stale' : ''}">${handshakeDisplay}</span>` : ''}
                             </h3>
                             <div class="client-meta">
