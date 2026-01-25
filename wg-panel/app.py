@@ -858,9 +858,16 @@ def get_clients():
                 
                 live = peers_live.get(pubkey, {})
                 handshake_seconds = live.get('handshake_seconds')
-                
-                # Determine connection status (5 minute threshold)
-                is_connected = (handshake_seconds is not None and 
+
+                # Calculate actual last_seen from WireGuard's handshake time
+                # This is the REAL time the client last communicated, not when we polled
+                if handshake_seconds is not None:
+                    actual_last_seen = (now - timedelta(seconds=handshake_seconds)).isoformat()
+                else:
+                    actual_last_seen = None
+
+                # Determine connection status (10 minute threshold)
+                is_connected = (handshake_seconds is not None and
                                handshake_seconds < CONNECTION_THRESHOLD_SECONDS)
                 
                 # Get note
@@ -903,10 +910,11 @@ def get_clients():
                         session_start = now.isoformat()
                         log_connection_event(name, 'connected', endpoint)
 
+                    # Use actual handshake time as last_seen, not poll time
                     conn.execute('''
                         INSERT OR REPLACE INTO client_sessions (name, session_start, last_seen, last_endpoint, is_connected)
                         VALUES (?, ?, ?, ?, 1)
-                    ''', (name, session_start, now.isoformat(), endpoint))
+                    ''', (name, session_start, actual_last_seen or now.isoformat(), endpoint))
 
                     # Calculate connection duration
                     try:
@@ -935,8 +943,12 @@ def get_clients():
                             # Still in grace period, keep showing as connected
                             in_grace_period = True
                     elif session_row:
-                        # Was already disconnected
-                        pass  # Don't update, keep existing session_start for when they return
+                        # Was already disconnected, but update last_seen/endpoint if we have fresh data
+                        # This handles mobile clients that change IP or have handshakes > 10 min
+                        if actual_last_seen and endpoint:
+                            conn.execute('''
+                                UPDATE client_sessions SET last_seen = ?, last_endpoint = ? WHERE name = ?
+                            ''', (actual_last_seen, endpoint, name))
 
                     # During grace period, keep showing as connected with duration
                     if in_grace_period and session_row and session_row['session_start']:
@@ -950,11 +962,20 @@ def get_clients():
                         connection_duration = None
                 
                 conn.commit()
-                
-                # Get last seen for offline clients
-                if not is_connected and session_row and session_row['last_seen']:
-                    last_seen = session_row['last_seen']
-                    last_endpoint = session_row['last_endpoint']
+
+                # Get last seen for offline clients - prefer actual handshake time over stored value
+                if not is_connected:
+                    # Use actual_last_seen from WireGuard if available (most accurate)
+                    if actual_last_seen:
+                        last_seen = actual_last_seen
+                        last_endpoint = endpoint if endpoint else (session_row['last_endpoint'] if session_row else None)
+                    elif session_row and session_row['last_seen']:
+                        # Fall back to stored value if no current handshake data
+                        last_seen = session_row['last_seen']
+                        last_endpoint = session_row['last_endpoint']
+                    else:
+                        last_seen = None
+                        last_endpoint = None
                 else:
                     last_seen = None
                     last_endpoint = None
