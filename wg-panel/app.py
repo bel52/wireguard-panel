@@ -55,7 +55,7 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection for cookies
 # app.config['SESSION_COOKIE_SECURE'] = True
 
 # App version for cache busting (update when making breaking changes)
-APP_VERSION = '4.0.1'
+APP_VERSION = '4.1.0'
 
 @app.after_request
 def set_cache_headers(response):
@@ -242,6 +242,83 @@ def init_secret_key():
             conn.commit()
             app.secret_key = new_key
             logger.info("Generated and stored new secret key in database")
+    finally:
+        conn.close()
+
+
+def init_credentials():
+    """Initialize credentials with persistence.
+
+    Priority:
+    1. Database stored credentials (if set)
+    2. Environment variables (WG_PANEL_USER, WG_PANEL_PASS_HASH, WG_PANEL_PASS)
+
+    This allows credentials to be changed through the UI and persist across restarts.
+    """
+    global AUTH_USER, AUTH_PASS_HASH, AUTH_PASS_PLAIN
+
+    conn = get_db()
+    try:
+        # Try to load username from database
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'auth_username'"
+        ).fetchone()
+        if row:
+            AUTH_USER = row['value']
+            logger.info("Loaded username from database")
+
+        # Try to load password hash from database
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'auth_password_hash'"
+        ).fetchone()
+        if row:
+            AUTH_PASS_HASH = row['value']
+            AUTH_PASS_PLAIN = ''  # Clear plain password if hash is set
+            logger.info("Loaded password hash from database")
+    finally:
+        conn.close()
+
+
+def update_credentials(new_username=None, new_password=None):
+    """Update stored credentials in the database.
+
+    Args:
+        new_username: New username (if None, username is not changed)
+        new_password: New password in plain text (will be hashed)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    global AUTH_USER, AUTH_PASS_HASH, AUTH_PASS_PLAIN
+    import hashlib
+
+    conn = get_db()
+    try:
+        if new_username:
+            # Store username
+            conn.execute('''
+                INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                VALUES ('auth_username', ?, datetime('now'))
+            ''', (new_username,))
+            AUTH_USER = new_username
+            logger.info(f"Username updated to: {new_username}")
+
+        if new_password:
+            # Hash and store password
+            password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+            conn.execute('''
+                INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                VALUES ('auth_password_hash', ?, datetime('now'))
+            ''', (password_hash,))
+            AUTH_PASS_HASH = password_hash
+            AUTH_PASS_PLAIN = ''  # Clear plain password
+            logger.info("Password updated")
+
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update credentials: {e}")
+        return False
     finally:
         conn.close()
 
@@ -2219,6 +2296,7 @@ TEMPLATE = '''
                 <button class="btn btn-secondary" onclick="showHistoryModal()">History</button>
                 <button class="demo-toggle" id="demoToggle" onclick="toggleDemoMode()">Demo</button>
                 <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
+                <button class="btn btn-secondary" onclick="showSettingsModal()" title="Settings">⚙️</button>
                 <a href="{{ url_for('logout') }}" class="btn btn-secondary">Logout</a>
             </div>
         </div>
@@ -2386,14 +2464,61 @@ TEMPLATE = '''
                 </form>
             </div>
         </div>
-        
+
+        <div class="modal" id="settingsModal">
+            <div class="modal-content">
+                <h2>Settings</h2>
+                <div class="settings-section">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">Change Username</h3>
+                    <form id="usernameForm">
+                        <div class="form-group">
+                            <label>Current Password (required)</label>
+                            <input type="password" id="usernameCurrentPass" required autocomplete="current-password">
+                        </div>
+                        <div class="form-group">
+                            <label>New Username</label>
+                            <input type="text" id="newUsername" required pattern="[a-zA-Z0-9_-]+" minlength="3" maxlength="32" autocomplete="username">
+                        </div>
+                        <div class="form-actions" style="margin-bottom:0;">
+                            <button type="submit" class="btn">Change Username</button>
+                        </div>
+                    </form>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
+                <div class="settings-section">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">Change Password</h3>
+                    <form id="passwordForm">
+                        <div class="form-group">
+                            <label>Current Password</label>
+                            <input type="password" id="currentPassword" required autocomplete="current-password">
+                        </div>
+                        <div class="form-group">
+                            <label>New Password</label>
+                            <input type="password" id="newPassword" required minlength="6" autocomplete="new-password">
+                        </div>
+                        <div class="form-group">
+                            <label>Confirm New Password</label>
+                            <input type="password" id="confirmPassword" required minlength="6" autocomplete="new-password">
+                        </div>
+                        <div class="form-actions" style="margin-bottom:0;">
+                            <button type="submit" class="btn">Change Password</button>
+                        </div>
+                    </form>
+                </div>
+                <div class="form-actions" style="margin-top:20px;padding-top:15px;border-top:1px solid var(--bg-tertiary);">
+                    <button type="button" class="btn btn-secondary" onclick="hideModals()">Close</button>
+                </div>
+                <div id="settingsMessage" style="display:none;margin-top:15px;padding:10px;border-radius:8px;text-align:center;"></div>
+            </div>
+        </div>
+
         <script>
             // ===== CSRF Token =====
             const CSRF_TOKEN = '{{ csrf_token() }}';
 
             // ===== Cache/Storage Version Management =====
             // Prevents stale localStorage data from breaking the app
-            const APP_STORAGE_VERSION = '4.0.1';
+            const APP_STORAGE_VERSION = '4.1.0';
             const storedVersion = localStorage.getItem('appVersion');
             if (storedVersion !== APP_STORAGE_VERSION) {
                 // Clear potentially stale settings on version change
@@ -2418,15 +2543,29 @@ TEMPLATE = '''
             let sessionExpired = false;  // Track if session has expired to prevent spam
 
             // ===== API Fetch Helper =====
-            // Centralized fetch handler that properly handles auth errors and redirects
+            // Centralized fetch handler with timeout, auth handling, and comprehensive error handling
+            const API_TIMEOUT_MS = 10000;  // 10 second timeout for API calls
+
             function apiFetch(url, options = {}) {
-                return fetch(url, options)
+                // Create abort controller for timeout
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+                // Merge abort signal into options
+                const fetchOptions = {
+                    ...options,
+                    signal: controller.signal
+                };
+
+                return fetch(url, fetchOptions)
                     .then(response => {
+                        clearTimeout(timeoutId);
+
                         // Check for 401 Unauthorized - session expired
                         if (response.status === 401) {
                             if (!sessionExpired) {
                                 sessionExpired = true;
-                                console.warn('Session expired, redirecting to login');
+                                console.warn('Session expired (401), redirecting to login');
                                 showSessionExpiredError();
                             }
                             throw new Error('Session expired');
@@ -2435,7 +2574,7 @@ TEMPLATE = '''
                         if (response.redirected && response.url.includes('/login')) {
                             if (!sessionExpired) {
                                 sessionExpired = true;
-                                console.warn('Redirected to login, session may have expired');
+                                console.warn('Redirected to login, session expired');
                                 showSessionExpiredError();
                             }
                             throw new Error('Session expired');
@@ -2445,11 +2584,41 @@ TEMPLATE = '''
                             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                         }
                         return response;
+                    })
+                    .catch(err => {
+                        clearTimeout(timeoutId);
+
+                        // Handle abort/timeout
+                        if (err.name === 'AbortError') {
+                            console.error('API request timed out:', url);
+                            throw new Error('Request timed out - server not responding');
+                        }
+
+                        // Handle network errors (fetch throws TypeError for network issues)
+                        if (err instanceof TypeError && err.message.includes('fetch')) {
+                            console.error('Network error:', err);
+                            throw new Error('Network error - check your connection');
+                        }
+
+                        // Re-throw other errors
+                        throw err;
                     });
             }
 
+            // Safe JSON parser with error logging
+            function safeParseJSON(response) {
+                return response.text().then(text => {
+                    try {
+                        return JSON.parse(text);
+                    } catch (e) {
+                        console.error('JSON parse error. Response text:', text.substring(0, 500));
+                        throw new Error('Server returned invalid data');
+                    }
+                });
+            }
+
             function showSessionExpiredError() {
-                // Show a clear error message instead of leaving UI stuck on "Loading..."
+                // Show a clear error message and redirect to login
                 document.getElementById('stats-grid').innerHTML = `
                     <div class="stat-box warning">
                         <div class="number">!</div>
@@ -2459,27 +2628,72 @@ TEMPLATE = '''
                 document.getElementById('client-grid').innerHTML = `
                     <div class="empty-state">
                         <p>Your session has expired.</p>
-                        <p><a href="/login" style="color:var(--accent-primary);">Click here to log in again</a></p>
+                        <p style="margin-top:10px;">Redirecting to login...</p>
                     </div>
                 `;
                 // Also update activity section
                 const activityList = document.getElementById('activityList');
                 if (activityList) {
-                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Session expired - please log in</div>';
+                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Session expired</div>';
                 }
+                // Redirect to login after a brief delay so user sees the message
+                setTimeout(() => {
+                    window.location.href = '/login';
+                }, 1500);
             }
 
-            function showApiError(message) {
-                // Generic API error display
+            function showApiError(message, showRetry = true) {
+                // Generic API error display with retry button
+                const retryBtn = showRetry ? `<button class="btn" onclick="retryLoad()" style="margin-top:15px;">Retry</button>` : '';
                 document.getElementById('stats-grid').innerHTML = `
                     <div class="stat-box warning">
                         <div class="number">!</div>
-                        <div class="label">API Error</div>
+                        <div class="label">Connection Error</div>
                     </div>
                 `;
-                document.getElementById('client-grid').innerHTML =
-                    '<div class="empty-state">' + (message || 'Failed to load data. Check server connection.') + '</div>';
+                document.getElementById('client-grid').innerHTML = `
+                    <div class="empty-state">
+                        <p>${message || 'Failed to load data. Check server connection.'}</p>
+                        ${retryBtn}
+                    </div>
+                `;
+                const activityList = document.getElementById('activityList');
+                if (activityList) {
+                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Unable to load activity</div>';
+                }
             }
+
+            function retryLoad() {
+                // Reset error state and retry
+                document.getElementById('stats-grid').innerHTML = `
+                    <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
+                `;
+                document.getElementById('client-grid').innerHTML = `
+                    <div class="empty-state">Loading clients...</div>
+                `;
+                loadingStartTime = Date.now();
+                refreshDashboard();
+                fetchHealth();
+                updateActivitySection();
+            }
+
+            // ===== Loading Timeout =====
+            const LOADING_TIMEOUT_MS = 15000;  // 15 seconds before showing error
+            let loadingStartTime = Date.now();
+            let initialLoadComplete = false;
+
+            function checkLoadingTimeout() {
+                if (initialLoadComplete || sessionExpired) return;
+
+                const elapsed = Date.now() - loadingStartTime;
+                if (elapsed > LOADING_TIMEOUT_MS) {
+                    console.error('Loading timeout - UI stuck for', elapsed, 'ms');
+                    showApiError('Loading timed out. The server may be unreachable.', true);
+                }
+            }
+
+            // Check for loading timeout every 5 seconds
+            setInterval(checkLoadingTimeout, 5000);
 
             // ===== Theme =====
             function toggleTheme() {
@@ -2514,14 +2728,14 @@ TEMPLATE = '''
             function redactIP(ip) {
                 if (!demoMode || !ip) return ip;
                 // Redact IP addresses
-                return ip.replace(/\d+\.\d+\.\d+\.\d+/g, 'xxx.xxx.xxx.xxx')
-                         .replace(/:\d+/g, ':xxxxx');
+                return ip.replace(/\\d+\\.\\d+\\.\\d+\\.\\d+/g, 'xxx.xxx.xxx.xxx')
+                         .replace(/:\\d+/g, ':xxxxx');
             }
 
             function redactVPNIP(ip) {
                 if (!demoMode || !ip) return ip;
                 // Partially mask VPN IPs like 10.6.0.2 -> 10.6.0.x
-                return ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1x');
+                return ip.replace(/(\\d+\\.\\d+\\.\\d+\\.)\\d+/, '$1x');
             }
 
             function redactLocation(geo) {
@@ -2608,12 +2822,12 @@ TEMPLATE = '''
             function fetchHealth() {
                 // Add cache-busting timestamp to prevent browser caching
                 apiFetch('/api/health?_t=' + Date.now())
-                    .then(r => r.json())
+                    .then(safeParseJSON)
                     .then(updateHealthCard)
                     .catch(err => {
                         if (err.message === 'Session expired') return;  // Already handled
-                        console.error('Health check failed:', err);
-                        updateHealthCard({ overall: 'down', checks: [{ name: 'API', status: 'fail', detail: 'Unable to fetch health status' }] });
+                        console.error('Health check failed:', err.message);
+                        updateHealthCard({ overall: 'down', checks: [{ name: 'API', status: 'fail', detail: err.message || 'Unable to fetch health status' }] });
                     });
             }
 
@@ -2683,7 +2897,7 @@ TEMPLATE = '''
             function updateActivitySection() {
                 // Add cache-busting timestamp to prevent browser caching
                 apiFetch('/api/history?_t=' + Date.now())
-                    .then(r => r.json())
+                    .then(safeParseJSON)
                     .then(data => {
                         const list = document.getElementById('activityList');
                         const count = document.getElementById('activityCount');
@@ -2738,7 +2952,7 @@ TEMPLATE = '''
                     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
                 })
-                .then(r => r.json())
+                .then(safeParseJSON)
                 .then(data => {
                     if (data.ok) {
                         refreshDashboard();
@@ -2748,7 +2962,7 @@ TEMPLATE = '''
                 })
                 .catch(err => {
                     if (err.message === 'Session expired') return;  // Already handled
-                    alert('Error: ' + err);
+                    alert('Error: ' + err.message);
                 });
             }
 
@@ -2758,7 +2972,7 @@ TEMPLATE = '''
                     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
                     body: JSON.stringify({ name: name })
                 })
-                .then(r => r.json())
+                .then(safeParseJSON)
                 .then(data => {
                     if (data.ok) {
                         refreshDashboard();
@@ -2768,7 +2982,7 @@ TEMPLATE = '''
                 })
                 .catch(err => {
                     if (err.message === 'Session expired') return;  // Already handled
-                    alert('Error: ' + err);
+                    alert('Error: ' + err.message);
                 });
             }
 
@@ -2801,7 +3015,7 @@ TEMPLATE = '''
             }
             function showHistoryModal() {
                 apiFetch('/api/history')
-                    .then(r => r.json())
+                    .then(safeParseJSON)
                     .then(data => {
                         const list = document.getElementById('historyList');
                         if (data.length === 0) {
@@ -2822,10 +3036,10 @@ TEMPLATE = '''
                     })
                     .catch(err => {
                         if (err.message === 'Session expired') return;  // Already handled
-                        console.error('History fetch failed:', err);
+                        console.error('History fetch failed:', err.message);
                         const list = document.getElementById('historyList');
                         if (list) {
-                            list.innerHTML = '<div class="empty-state">Failed to load history</div>';
+                            list.innerHTML = '<div class="empty-state">Failed to load history: ' + err.message + '</div>';
                         }
                         document.getElementById('historyModal').classList.add('active');
                     });
@@ -2862,7 +3076,7 @@ TEMPLATE = '''
                     headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
                     body: JSON.stringify({name, note})
                 })
-                .then(r => r.json())
+                .then(safeParseJSON)
                 .then(data => {
                     if (data.ok) {
                         hideModals();
@@ -2873,8 +3087,115 @@ TEMPLATE = '''
                 })
                 .catch(err => {
                     if (err.message === 'Session expired') return;  // Already handled
-                    console.error('Note save failed:', err);
+                    console.error('Note save failed:', err.message);
                     alert('Failed to save note: ' + err.message);
+                });
+            });
+
+            // ===== Settings Modal =====
+            function showSettingsModal() {
+                // Clear previous inputs
+                document.getElementById('usernameCurrentPass').value = '';
+                document.getElementById('newUsername').value = '';
+                document.getElementById('currentPassword').value = '';
+                document.getElementById('newPassword').value = '';
+                document.getElementById('confirmPassword').value = '';
+                hideSettingsMessage();
+                document.getElementById('settingsModal').classList.add('active');
+            }
+
+            function showSettingsMessage(message, isError = false) {
+                const msgEl = document.getElementById('settingsMessage');
+                msgEl.textContent = message;
+                msgEl.style.display = 'block';
+                msgEl.style.background = isError ? 'rgba(231,76,60,0.15)' : 'rgba(0,212,170,0.15)';
+                msgEl.style.color = isError ? 'var(--danger)' : 'var(--success)';
+            }
+
+            function hideSettingsMessage() {
+                document.getElementById('settingsMessage').style.display = 'none';
+            }
+
+            // Username change form
+            document.getElementById('usernameForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+                const currentPassword = document.getElementById('usernameCurrentPass').value;
+                const newUsername = document.getElementById('newUsername').value.trim();
+
+                if (!currentPassword || !newUsername) {
+                    showSettingsMessage('Please fill in all fields', true);
+                    return;
+                }
+
+                apiFetch('/api/settings/username', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
+                    body: JSON.stringify({
+                        current_password: currentPassword,
+                        new_username: newUsername
+                    })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    if (data.ok) {
+                        showSettingsMessage('Username changed! Redirecting to login...');
+                        setTimeout(() => {
+                            window.location.href = '/login';
+                        }, 2000);
+                    } else {
+                        showSettingsMessage(data.error || 'Failed to change username', true);
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;
+                    showSettingsMessage(err.message || 'Failed to change username', true);
+                });
+            });
+
+            // Password change form
+            document.getElementById('passwordForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+                const currentPassword = document.getElementById('currentPassword').value;
+                const newPassword = document.getElementById('newPassword').value;
+                const confirmPassword = document.getElementById('confirmPassword').value;
+
+                if (!currentPassword || !newPassword || !confirmPassword) {
+                    showSettingsMessage('Please fill in all fields', true);
+                    return;
+                }
+
+                if (newPassword !== confirmPassword) {
+                    showSettingsMessage('New passwords do not match', true);
+                    return;
+                }
+
+                if (newPassword.length < 6) {
+                    showSettingsMessage('New password must be at least 6 characters', true);
+                    return;
+                }
+
+                apiFetch('/api/settings/password', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
+                    body: JSON.stringify({
+                        current_password: currentPassword,
+                        new_password: newPassword
+                    })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    if (data.ok) {
+                        showSettingsMessage('Password changed! Redirecting to login...');
+                        setTimeout(() => {
+                            window.location.href = '/login';
+                        }, 2000);
+                    } else {
+                        showSettingsMessage(data.error || 'Failed to change password', true);
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;
+                    showSettingsMessage(err.message || 'Failed to change password', true);
                 });
             });
 
@@ -3114,8 +3435,11 @@ TEMPLATE = '''
 
                 // Add cache-busting timestamp to prevent browser caching
                 apiFetch('/api/status?_t=' + Date.now())
-                    .then(r => r.json())
+                    .then(safeParseJSON)
                     .then(data => {
+                        // Mark initial load complete (stops loading timeout checker)
+                        initialLoadComplete = true;
+
                         currentStats = data.stats;
                         allClients = data.clients || [];
 
@@ -3136,16 +3460,9 @@ TEMPLATE = '''
                     })
                     .catch(err => {
                         if (err.message === 'Session expired') return;  // Already handled by apiFetch
-                        console.error('Refresh failed:', err);
-                        // Show error state in stats grid
-                        document.getElementById('stats-grid').innerHTML = `
-                            <div class="stat-box warning">
-                                <div class="number">!</div>
-                                <div class="label">API Error</div>
-                            </div>
-                        `;
-                        document.getElementById('client-grid').innerHTML =
-                            '<div class="empty-state">Failed to load data. Check server connection.</div>';
+                        console.error('Refresh failed:', err.message);
+                        // Show user-friendly error with retry option
+                        showApiError(err.message || 'Failed to load data. Check server connection.', true);
                     });
             }
 
@@ -3372,6 +3689,72 @@ def api_unpause():
         return jsonify({'ok': False, 'error': msg}), 400
     return jsonify({'error': 'invalid request'}), 400
 
+@app.route('/api/settings/password', methods=['POST'])
+@login_required
+@csrf_required
+def api_change_password():
+    """Change the admin password. Requires current password verification."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+
+    current_password = data.get('current_password', '')
+    new_password = data.get('new_password', '')
+
+    # Validate inputs
+    if not current_password or not new_password:
+        return jsonify({'error': 'Current password and new password are required'}), 400
+
+    if len(new_password) < 6:
+        return jsonify({'error': 'New password must be at least 6 characters'}), 400
+
+    # Verify current password
+    if not check_password(current_password):
+        return jsonify({'error': 'Current password is incorrect'}), 403
+
+    # Update password
+    if update_credentials(new_password=new_password):
+        # Clear session to force re-login with new password
+        session.clear()
+        return jsonify({'ok': True, 'message': 'Password changed successfully'})
+
+    return jsonify({'error': 'Failed to update password'}), 500
+
+@app.route('/api/settings/username', methods=['POST'])
+@login_required
+@csrf_required
+def api_change_username():
+    """Change the admin username. Requires current password verification."""
+    import re
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+
+    current_password = data.get('current_password', '')
+    new_username = data.get('new_username', '').strip()
+
+    # Validate inputs
+    if not current_password or not new_username:
+        return jsonify({'error': 'Current password and new username are required'}), 400
+
+    if len(new_username) < 3 or len(new_username) > 32:
+        return jsonify({'error': 'Username must be 3-32 characters'}), 400
+
+    if not re.match(r'^[a-zA-Z0-9_-]+$', new_username):
+        return jsonify({'error': 'Username can only contain letters, numbers, hyphens, and underscores'}), 400
+
+    # Verify current password
+    if not check_password(current_password):
+        return jsonify({'error': 'Current password is incorrect'}), 403
+
+    # Update username
+    if update_credentials(new_username=new_username):
+        # Clear session to force re-login with new username
+        session.clear()
+        return jsonify({'ok': True, 'message': 'Username changed successfully'})
+
+    return jsonify({'error': 'Failed to update username'}), 500
+
 @app.route('/add', methods=['POST'])
 @login_required
 @csrf_required
@@ -3431,6 +3814,9 @@ if __name__ == '__main__':
 
     # Initialize secret key from database (ensures sessions survive restarts)
     init_secret_key()
+
+    # Initialize credentials from database (allows UI-based credential changes)
+    init_credentials()
 
     # Load persistent traffic stats from database
     load_traffic_from_db()
