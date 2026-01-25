@@ -251,16 +251,84 @@ cmd_revoke() {
   echo "OK: revoked ${name}"
 }
 
+cmd_revoke_orphan() {
+  # Revoke an orphaned peer by public key (for peers without config files)
+  need_root revoke-orphan "$@"
+  ensure_prereqs
+  local pubkey="${1:-}"
+  [[ -n "$pubkey" ]] || { echo "Usage: wg-tool revoke-orphan <public_key>"; exit 1; }
+
+  # Validate pubkey format (base64, 44 chars with = padding)
+  if [[ ! "$pubkey" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "Invalid public key format"
+    exit 1
+  fi
+
+  # Check if peer exists in wg0.conf
+  if ! grep -q "PublicKey *= *${pubkey}" "$WG_CONF" 2>/dev/null; then
+    echo "Peer not found in wg0.conf"
+    exit 1
+  fi
+
+  # Remove peer block from wg0.conf matching this PublicKey
+  cp -a "$WG_CONF" "${WG_CONF}.bak_revoke_$(date +%Y%m%d_%H%M%S)"
+  awk -v pk="$pubkey" '
+    BEGIN {
+      skip = 0
+      blk = ""
+      # Escape regex special characters in the public key
+      gsub(/[[\\.^$*+?(){}|]/, "\\\\&", pk)
+    }
+    /^\[Peer\]/ {
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+      blk = $0 RS
+      skip = 0
+      next
+    }
+    /^\[Interface\]/ || /^\[/ {
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+      blk = ""
+      skip = 0
+      print
+      next
+    }
+    {
+      if (blk != "") {
+        blk = blk $0 RS
+        if ($0 ~ "^PublicKey *= *" pk "$") {
+          skip = 1
+        }
+      } else {
+        print
+      }
+    }
+    END {
+      if (blk != "" && !skip) {
+        printf "%s", blk
+      }
+    }
+  ' "$WG_CONF" > "${WG_CONF}.tmp"
+  mv "${WG_CONF}.tmp" "$WG_CONF"
+
+  apply_config
+  echo "OK: revoked orphan peer"
+}
+
 usage() {
   cat <<USAGE
 Usage: sudo wg-tool <command> [args]
 
 Commands:
-  add <name> [endpoint]   Create client + add peer (no disconnect)
-  qr <name>               Print QR code for client config
-  list                    List clients + peers
-  revoke <name>           Remove peer + delete client files (no disconnect)
-  show                    Show wireguard status
+  add <name> [endpoint]     Create client + add peer (no disconnect)
+  qr <name>                 Print QR code for client config
+  list                      List clients + peers
+  revoke <name>             Remove peer + delete client files (no disconnect)
+  revoke-orphan <pubkey>    Remove orphan peer by public key (no config files)
+  show                      Show wireguard status
 
 Notes:
 - Default endpoint is detected public IP; override with a DNS name if you have one.
@@ -277,6 +345,7 @@ main() {
     qr) cmd_qr "$@";;
     list) cmd_list;;
     revoke) cmd_revoke "$@";;
+    revoke-orphan) cmd_revoke_orphan "$@";;
     show) cmd_show;;
     ""|-h|--help|help) usage;;
     *) echo "Unknown command: $cmd"; usage; exit 1;;

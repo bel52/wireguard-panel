@@ -1105,20 +1105,29 @@ def add_client(name):
         log_connection_event(name, 'created')
     return code == 0, output
 
-def revoke_client(name):
-    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-        return False, "Invalid name."
-    
-    output, code = run_cmd(['wg-tool', 'revoke', name])
-    if code == 0:
-        log_connection_event(name, 'revoked')
-        conn = get_db()
-        conn.execute('DELETE FROM client_notes WHERE name = ?', (name,))
-        conn.execute('DELETE FROM client_sessions WHERE name = ?', (name,))
-        conn.execute('DELETE FROM bandwidth_samples WHERE client_name = ?', (name,))
-        conn.commit()
-        conn.close()
-    return code == 0, output
+def revoke_client(name, pubkey=None):
+    """Revoke a client by name, or by public key for orphaned peers."""
+    # Try normal revoke by name first
+    if re.match(r'^[a-zA-Z0-9_-]+$', name):
+        output, code = run_cmd(['wg-tool', 'revoke', name])
+        if code == 0:
+            log_connection_event(name, 'revoked')
+            conn = get_db()
+            conn.execute('DELETE FROM client_notes WHERE name = ?', (name,))
+            conn.execute('DELETE FROM client_sessions WHERE name = ?', (name,))
+            conn.execute('DELETE FROM bandwidth_samples WHERE client_name = ?', (name,))
+            conn.commit()
+            conn.close()
+        return code == 0, output
+
+    # For orphaned peers (like "(no-name)"), use public key to revoke
+    if pubkey and re.match(r'^[A-Za-z0-9+/]{43}=$', pubkey):
+        output, code = run_cmd(['wg-tool', 'revoke-orphan', pubkey])
+        if code == 0:
+            log_connection_event(name or 'orphan-peer', 'revoked')
+        return code == 0, output
+
+    return False, "Invalid name or missing public key for orphan peer."
 
 def get_client_config(name):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
@@ -2279,6 +2288,7 @@ TEMPLATE = '''
                 <form method="POST" action="{{ url_for('revoke') }}">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="name" id="revokeInput">
+                    <input type="hidden" name="pubkey" id="revokePubkeyInput">
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" onclick="hideModals()">Cancel</button>
                         <button type="submit" class="btn btn-danger">Revoke</button>
@@ -2636,9 +2646,10 @@ TEMPLATE = '''
                         document.getElementById('historyModal').classList.add('active');
                     });
             }
-            function confirmRevoke(name) {
+            function confirmRevoke(name, pubkey) {
                 document.getElementById('revokeClientName').textContent = name;
                 document.getElementById('revokeInput').value = name;
+                document.getElementById('revokePubkeyInput').value = pubkey || '';
                 document.getElementById('revokeModal').classList.add('active');
             }
             function hideModals() {
@@ -2850,7 +2861,7 @@ TEMPLATE = '''
                             <button class="icon-btn" onclick="showConfig('${c.name}')" title="Config">📄</button>
                             <a href="/download/${c.name}" class="icon-btn" title="Download">⬇️</a>
                             <button class="icon-btn" onclick="showNote('${c.name}', '${(c.note || '').replace(/'/g, "\\'")}')" title="Edit Note">✏️</button>
-                            <button class="icon-btn danger" onclick="confirmRevoke('${c.name}')" title="Revoke">🗑️</button>
+                            <button class="icon-btn danger" onclick="confirmRevoke('${c.name}', '${c.public_key}')" title="Revoke">🗑️</button>
                         </div>
                     </div>
                 `}).join('');
@@ -3186,9 +3197,11 @@ def add():
 @csrf_required
 def revoke():
     name = request.form.get('name', '').strip()
-    if name:
-        success, msg = revoke_client(name)
-        flash(f'Client "{name}" revoked' if success else f'Error: {msg}')
+    pubkey = request.form.get('pubkey', '').strip()
+    if name or pubkey:
+        success, msg = revoke_client(name, pubkey)
+        display_name = name if name and name != '(no-name)' else 'Orphan peer'
+        flash(f'Client "{display_name}" revoked' if success else f'Error: {msg}')
     return redirect(url_for('index'))
 
 @app.route('/qr/<name>')
