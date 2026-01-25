@@ -91,6 +91,14 @@ AUTH_PASS_PLAIN = os.environ.get('WG_PANEL_PASS', '')
 DB_PATH = os.environ.get('WG_PANEL_DB', '/opt/wg-panel/wg-panel.db')
 DNS_CHECK_ENABLED = os.environ.get('WG_PANEL_DNS_CHECK', '').lower() in ('1', 'true', 'yes')
 DNS_CHECK_SERVER = os.environ.get('WG_PANEL_DNS_SERVER', '10.6.0.1')
+
+# WireGuard config - auto-detected on startup
+WG_INTERFACE = ''
+WG_CONF_PATH = ''
+WG_CLIENTS_DIR = ''
+VPN_PREFIX = ''
+VPN_SUBNET = ''
+SERVER_PUBKEY = ''
 GEOIP_CACHE = {}
 BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
 CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
@@ -323,6 +331,190 @@ def update_credentials(new_username=None, new_password=None):
         conn.close()
 
 
+# --------------- WireGuard Auto-Detection ---------------
+
+def parse_subnet_from_conf(conf_path):
+    """Parse the subnet prefix from WireGuard config file.
+
+    Extracts the first 3 octets from Address = x.x.x.x/xx line.
+    Returns tuple of (prefix, full_subnet) e.g. ('10.50.0', '10.50.0.0/24')
+    """
+    try:
+        with open(conf_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Match Address = x.x.x.x/xx
+                match = re.match(r'^Address\s*=\s*(\d+\.\d+\.\d+)\.(\d+)/(\d+)', line)
+                if match:
+                    prefix = match.group(1)
+                    host = match.group(2)
+                    cidr = match.group(3)
+                    full_subnet = f"{prefix}.0/{cidr}"
+                    return prefix, full_subnet
+    except Exception as e:
+        logger.error(f"Failed to parse subnet from {conf_path}: {e}")
+    return None, None
+
+
+def detect_wireguard_interfaces():
+    """Detect available WireGuard interfaces.
+
+    First tries `wg show interfaces`, then falls back to scanning /etc/wireguard/*.conf
+    Returns list of interface names.
+    """
+    interfaces = []
+
+    # Try wg show interfaces first
+    try:
+        result = subprocess.run(
+            ['wg', 'show', 'interfaces'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            interfaces = result.stdout.strip().split()
+            if interfaces:
+                return interfaces
+    except Exception as e:
+        logger.debug(f"wg show interfaces failed: {e}")
+
+    # Fallback: scan /etc/wireguard/*.conf
+    try:
+        import glob
+        conf_files = glob.glob('/etc/wireguard/*.conf')
+        for conf_file in conf_files:
+            # Extract interface name from filename (e.g., /etc/wireguard/wg0.conf -> wg0)
+            name = os.path.basename(conf_file).replace('.conf', '')
+            # Skip files that look like client configs
+            if not name.endswith('_clients') and name not in interfaces:
+                interfaces.append(name)
+    except Exception as e:
+        logger.debug(f"Fallback interface detection failed: {e}")
+
+    return interfaces
+
+
+def get_server_pubkey(interface):
+    """Get the server's public key for the specified interface."""
+    try:
+        result = subprocess.run(
+            ['wg', 'show', interface, 'public-key'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception as e:
+        logger.debug(f"Failed to get public key via wg show: {e}")
+
+    # Fallback: try reading server.pub file
+    try:
+        pub_path = '/etc/wireguard/server.pub'
+        if os.path.exists(pub_path):
+            with open(pub_path, 'r') as f:
+                return f.read().strip()
+    except Exception as e:
+        logger.debug(f"Failed to read server.pub: {e}")
+
+    return None
+
+
+def init_wireguard_config():
+    """Initialize WireGuard configuration by auto-detecting settings.
+
+    This function:
+    1. Detects available WireGuard interfaces
+    2. Selects interface (from WG_INTERFACE env or auto-detect single interface)
+    3. Parses subnet prefix from config file
+    4. Gets server public key
+    5. Creates clients directory if needed
+
+    Exits with helpful message if configuration cannot be determined.
+    """
+    global WG_INTERFACE, WG_CONF_PATH, WG_CLIENTS_DIR, VPN_PREFIX, VPN_SUBNET, SERVER_PUBKEY
+
+    # Check for WG_INTERFACE environment variable first
+    env_interface = os.environ.get('WG_INTERFACE', '').strip()
+
+    if env_interface:
+        WG_INTERFACE = env_interface
+        logger.info(f"Using WireGuard interface from environment: {WG_INTERFACE}")
+    else:
+        # Auto-detect interfaces
+        interfaces = detect_wireguard_interfaces()
+
+        if len(interfaces) == 0:
+            logger.error("No WireGuard interfaces found!")
+            logger.error("Please ensure WireGuard is installed and configured.")
+            logger.error("Expected: /etc/wireguard/<interface>.conf")
+            print("\n" + "="*60)
+            print("ERROR: No WireGuard interfaces found!")
+            print("="*60)
+            print("\nPlease ensure WireGuard is installed and configured.")
+            print("Expected: /etc/wireguard/<interface>.conf")
+            print("="*60 + "\n")
+            import sys
+            sys.exit(1)
+        elif len(interfaces) == 1:
+            WG_INTERFACE = interfaces[0]
+            logger.info(f"Auto-detected WireGuard interface: {WG_INTERFACE}")
+        else:
+            logger.error(f"Multiple WireGuard interfaces found: {', '.join(interfaces)}")
+            logger.error("Please set WG_INTERFACE environment variable to specify which one to use.")
+            print("\n" + "="*60)
+            print("ERROR: Multiple WireGuard interfaces found!")
+            print("="*60)
+            print(f"\nAvailable interfaces: {', '.join(interfaces)}")
+            print("\nSet WG_INTERFACE environment variable to specify which one to use.")
+            print("Example: WG_INTERFACE=wg0")
+            print("\nFor systemd service, add to /etc/systemd/system/wg-panel.service:")
+            print("  Environment=\"WG_INTERFACE=wg0\"")
+            print("="*60 + "\n")
+            import sys
+            sys.exit(1)
+
+    # Set derived paths
+    WG_CONF_PATH = f'/etc/wireguard/{WG_INTERFACE}.conf'
+    WG_CLIENTS_DIR = f'/etc/wireguard/{WG_INTERFACE}_clients'
+
+    # Verify config file exists
+    if not os.path.exists(WG_CONF_PATH):
+        logger.error(f"WireGuard config not found: {WG_CONF_PATH}")
+        print(f"\nERROR: WireGuard config not found: {WG_CONF_PATH}\n")
+        import sys
+        sys.exit(1)
+
+    # Parse subnet from config
+    VPN_PREFIX, VPN_SUBNET = parse_subnet_from_conf(WG_CONF_PATH)
+    if not VPN_PREFIX:
+        logger.error(f"Could not parse subnet from {WG_CONF_PATH}")
+        logger.error("Expected 'Address = x.x.x.x/xx' in [Interface] section")
+        print(f"\nERROR: Could not parse subnet from {WG_CONF_PATH}")
+        print("Expected 'Address = x.x.x.x/xx' in [Interface] section\n")
+        import sys
+        sys.exit(1)
+
+    # Get server public key
+    SERVER_PUBKEY = get_server_pubkey(WG_INTERFACE)
+    if not SERVER_PUBKEY:
+        logger.warning(f"Could not determine server public key for {WG_INTERFACE}")
+        logger.warning("Client configs may not work correctly")
+
+    # Create clients directory if it doesn't exist
+    try:
+        os.makedirs(WG_CLIENTS_DIR, mode=0o700, exist_ok=True)
+        logger.debug(f"Ensured clients directory exists: {WG_CLIENTS_DIR}")
+    except Exception as e:
+        logger.error(f"Failed to create clients directory {WG_CLIENTS_DIR}: {e}")
+        # Don't exit - directory might be created with different permissions
+
+    # Log the complete configuration
+    logger.info(f"LeathGuard WireGuard configuration:")
+    logger.info(f"  Interface: {WG_INTERFACE}")
+    logger.info(f"  Config: {WG_CONF_PATH}")
+    logger.info(f"  Clients dir: {WG_CLIENTS_DIR}")
+    logger.info(f"  Subnet: {VPN_SUBNET}")
+    logger.info(f"  Server pubkey: {SERVER_PUBKEY[:20]}..." if SERVER_PUBKEY else "  Server pubkey: (not available)")
+
+
 # --------------- Auth ---------------
 
 # Rate limiting for login attempts: {ip: [(timestamp, ...], ...}
@@ -518,7 +710,8 @@ def get_server_uptime():
 
 def get_wg_uptime():
     try:
-        result = subprocess.run(['sudo', 'wg', 'show', 'wg0'],
+        iface = WG_INTERFACE or 'wg0'  # Fallback for before init
+        result = subprocess.run(['sudo', 'wg', 'show', iface],
                                 capture_output=True, text=True, timeout=5)
         return "active" if result.returncode == 0 else "down"
     except:
@@ -528,13 +721,14 @@ def get_wg_uptime():
 # --------------- Health Check Functions ---------------
 
 def check_wg_interface():
-    """Check if WireGuard interface wg0 is up."""
+    """Check if WireGuard interface is up."""
     try:
-        result = subprocess.run(['sudo', 'wg', 'show', 'wg0'],
+        iface = WG_INTERFACE or 'wg0'  # Fallback for before init
+        result = subprocess.run(['sudo', 'wg', 'show', iface],
                                 capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            return {'name': 'WireGuard interface', 'status': 'ok', 'detail': 'wg0 up and running'}
-        return {'name': 'WireGuard interface', 'status': 'fail', 'detail': 'wg0 not found or down'}
+            return {'name': 'WireGuard interface', 'status': 'ok', 'detail': f'{iface} up and running'}
+        return {'name': 'WireGuard interface', 'status': 'fail', 'detail': f'{iface} not found or down'}
     except subprocess.TimeoutExpired:
         return {'name': 'WireGuard interface', 'status': 'fail', 'detail': 'Command timed out'}
     except Exception as e:
@@ -983,7 +1177,8 @@ def get_clients():
     in_peers = False
     for line in output.split('\n'):
         line = line.strip()
-        if 'Peers in wg0.conf' in line:
+        # Match "Peers in <interface>.conf" (dynamic interface name)
+        if '== Peers in' in line and '.conf ==' in line:
             in_peers = True
             continue
         
@@ -1292,7 +1487,8 @@ def get_client_config(name):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return None
     try:
-        result = subprocess.run(['sudo', 'cat', f'/etc/wireguard/clients/{name}.conf'], 
+        conf_path = f'{WG_CLIENTS_DIR}/{name}.conf'
+        result = subprocess.run(['sudo', 'cat', conf_path],
                                 capture_output=True, text=True)
         if result.returncode == 0:
             return result.stdout
@@ -1305,7 +1501,7 @@ def get_client_qr(name):
         return None
     try:
         # Read config file without shell=True to prevent command injection
-        conf_path = f'/etc/wireguard/clients/{name}.conf'
+        conf_path = f'{WG_CLIENTS_DIR}/{name}.conf'
         cat_result = subprocess.run(
             ['sudo', 'cat', conf_path],
             capture_output=True, timeout=10
@@ -3818,6 +4014,9 @@ if __name__ == '__main__':
     # Initialize credentials from database (allows UI-based credential changes)
     init_credentials()
 
+    # Auto-detect WireGuard configuration
+    init_wireguard_config()
+
     # Load persistent traffic stats from database
     load_traffic_from_db()
     cleanup_old_traffic_samples()
@@ -3829,5 +4028,6 @@ if __name__ == '__main__':
         print(f"Restored iptables rules for {restored} paused client(s)")
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"LeathGuard v4 starting on port {port}")
+    print(f"LeathGuard starting - Interface: {WG_INTERFACE}, Subnet: {VPN_SUBNET}, Clients dir: {WG_CLIENTS_DIR}")
+    print(f"LeathGuard v4 running on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
