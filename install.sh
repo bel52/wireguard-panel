@@ -66,12 +66,30 @@ python3 -m venv "$INSTALL_DIR/venv"
 touch "$INSTALL_DIR/wg-panel.db"
 chmod 600 "$INSTALL_DIR/wg-panel.db"
 
+# Detect WireGuard interface for systemd dependency
+WG_IFACE=""
+if command -v wg &>/dev/null; then
+    WG_IFACE=$(wg show interfaces 2>/dev/null | awk '{print $1}')
+fi
+if [[ -z "$WG_IFACE" ]]; then
+    # Fallback: check for .conf files
+    for conf in /etc/wireguard/*.conf; do
+        [[ -f "$conf" ]] || continue
+        WG_IFACE=$(basename "$conf" .conf)
+        break
+    done
+fi
+WG_SERVICE=""
+if [[ -n "$WG_IFACE" ]]; then
+    WG_SERVICE=" wg-quick@${WG_IFACE}.service"
+fi
+
 # Install systemd service
 echo "[5/6] Configuring systemd service..."
 cat > /etc/systemd/system/wg-panel.service <<EOF
 [Unit]
 Description=LeathGuard Web Panel
-After=network.target wg-quick@wg0.service
+After=network.target${WG_SERVICE}
 
 [Service]
 Type=simple
@@ -80,6 +98,8 @@ WorkingDirectory=$INSTALL_DIR
 Environment="WG_PANEL_USER=$WG_USER"
 Environment="WG_PANEL_PASS_HASH=$PASS_HASH"
 Environment="WG_PANEL_DB=$INSTALL_DIR/wg-panel.db"
+# WG_INTERFACE is auto-detected. Uncomment below to override for multi-interface setups:
+# Environment="WG_INTERFACE=wg1"
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/app.py $PORT
 Restart=always
 RestartSec=5

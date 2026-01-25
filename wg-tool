@@ -11,15 +11,143 @@ set -euo pipefail
 #   sudo wg-tool revoke <name>           Remove peer + delete client files
 #   sudo wg-tool show                    Show live WireGuard status
 #
+# Environment variables:
+#   WG_INTERFACE - Specify which WireGuard interface to use (auto-detected if not set)
+#
 
 WG_DIR="/etc/wireguard"
-WG_CONF="${WG_DIR}/wg0.conf"
-CLIENT_DIR="${WG_DIR}/clients"
+
+# --------------- Auto-Detection ---------------
+
+detect_interface() {
+    # Check for WG_INTERFACE environment variable first
+    if [[ -n "${WG_INTERFACE:-}" ]]; then
+        echo "$WG_INTERFACE"
+        return 0
+    fi
+
+    # Try to get interfaces from wg show
+    local interfaces
+    if interfaces=$(wg show interfaces 2>/dev/null) && [[ -n "$interfaces" ]]; then
+        local iface_array=($interfaces)
+        if [[ ${#iface_array[@]} -eq 1 ]]; then
+            echo "${iface_array[0]}"
+            return 0
+        elif [[ ${#iface_array[@]} -eq 0 ]]; then
+            return 1
+        else
+            echo "ERROR: Multiple WireGuard interfaces found: $interfaces" >&2
+            echo "Set WG_INTERFACE environment variable to specify which one to use." >&2
+            echo "Example: WG_INTERFACE=wg0 wg-tool list" >&2
+            exit 1
+        fi
+    fi
+
+    # Fallback: scan /etc/wireguard/*.conf
+    local conf_files=("$WG_DIR"/*.conf)
+    local valid_confs=()
+    for conf in "${conf_files[@]}"; do
+        [[ -f "$conf" ]] || continue
+        local name
+        name=$(basename "$conf" .conf)
+        # Skip client directories
+        [[ "$name" != *_clients* ]] && valid_confs+=("$name")
+    done
+
+    if [[ ${#valid_confs[@]} -eq 1 ]]; then
+        echo "${valid_confs[0]}"
+        return 0
+    elif [[ ${#valid_confs[@]} -eq 0 ]]; then
+        return 1
+    else
+        echo "ERROR: Multiple WireGuard configs found: ${valid_confs[*]}" >&2
+        echo "Set WG_INTERFACE environment variable to specify which one to use." >&2
+        echo "Example: WG_INTERFACE=wg0 wg-tool list" >&2
+        exit 1
+    fi
+}
+
+detect_subnet_prefix() {
+    local conf_file="$1"
+    # Parse Address = x.x.x.x/xx and extract first 3 octets
+    grep -E "^Address\s*=" "$conf_file" 2>/dev/null | head -1 | \
+        sed -E 's/.*=\s*([0-9]+\.[0-9]+\.[0-9]+)\..*/\1/'
+}
+
+detect_server_pubkey() {
+    local iface="$1"
+    local pubkey
+
+    # Try wg show first
+    if pubkey=$(wg show "$iface" public-key 2>/dev/null) && [[ -n "$pubkey" ]]; then
+        echo "$pubkey"
+        return 0
+    fi
+
+    # Fallback: read server.pub file
+    if [[ -f "${WG_DIR}/server.pub" ]]; then
+        cat "${WG_DIR}/server.pub"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_server_port() {
+    local conf_file="$1"
+    # Parse ListenPort from config, default to 51820
+    local port
+    port=$(grep -E "^ListenPort\s*=" "$conf_file" 2>/dev/null | head -1 | \
+        sed -E 's/.*=\s*([0-9]+).*/\1/')
+    echo "${port:-51820}"
+}
+
+detect_dns() {
+    local conf_file="$1"
+    local prefix="$2"
+    # First try to get DNS from existing client configs
+    # Otherwise default to server IP (first in subnet)
+    echo "${prefix}.1"
+}
+
+# Auto-detect interface
+WG_IFACE=$(detect_interface) || {
+    echo "ERROR: No WireGuard interfaces found!" >&2
+    echo "Please ensure WireGuard is installed and configured." >&2
+    echo "Expected: /etc/wireguard/<interface>.conf" >&2
+    exit 1
+}
+
+# Set paths based on detected interface
+WG_CONF="${WG_DIR}/${WG_IFACE}.conf"
+CLIENT_DIR="${WG_DIR}/${WG_IFACE}_clients"
+
+# Verify config exists
+[[ -f "$WG_CONF" ]] || {
+    echo "ERROR: WireGuard config not found: $WG_CONF" >&2
+    exit 1
+}
+
+# Auto-detect other settings
+VPN_PREFIX=$(detect_subnet_prefix "$WG_CONF") || {
+    echo "ERROR: Could not parse subnet from $WG_CONF" >&2
+    echo "Expected 'Address = x.x.x.x/xx' in [Interface] section" >&2
+    exit 1
+}
+SERVER_PORT=$(detect_server_port "$WG_CONF")
+DNS_IP=$(detect_dns "$WG_CONF" "$VPN_PREFIX")
+
+# Get server public key (needed for client configs)
+SERVER_PUB_KEY=""
+if ! SERVER_PUB_KEY=$(detect_server_pubkey "$WG_IFACE"); then
+    echo "WARNING: Could not determine server public key" >&2
+    echo "Client configs may not work correctly" >&2
+fi
+
+# Legacy compatibility - keep SERVER_PUB path but prefer runtime detection
 SERVER_PUB="${WG_DIR}/server.pub"
-SERVER_PORT="51820"
-VPN_PREFIX="10.6.0"
-DNS_IP="10.6.0.1"
-WG_IFACE="wg0"
+
+# --------------- End Auto-Detection ---------------
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "Run as root: sudo $0 $*"; exit 1; }; }
 
@@ -47,7 +175,11 @@ ensure_prereqs() {
   command -v wg >/dev/null
   command -v qrencode >/dev/null || apt-get -y install qrencode >/dev/null
   [[ -f "$WG_CONF" ]] || { echo "Missing: $WG_CONF"; exit 1; }
-  [[ -f "$SERVER_PUB" ]] || { echo "Missing: $SERVER_PUB (server.pub)."; exit 1; }
+  # Server public key is auto-detected; only check for fallback file if runtime detection failed
+  if [[ -z "$SERVER_PUB_KEY" ]] && [[ ! -f "$SERVER_PUB" ]]; then
+    echo "Missing server public key: could not detect via 'wg show' and $SERVER_PUB not found"
+    exit 1
+  fi
 }
 
 # Apply config changes without restarting (no client disconnection)
@@ -59,8 +191,8 @@ apply_config() {
     echo "(applied live via syncconf)"
   else
     # Interface is down — bring it up
-    systemctl start wg-quick@wg0
-    echo "(interface was down; started wg-quick@wg0)"
+    systemctl start "wg-quick@${WG_IFACE}"
+    echo "(interface was down; started wg-quick@${WG_IFACE})"
   fi
 }
 
@@ -92,7 +224,12 @@ cmd_add() {
   local client_priv client_pub server_pub
   client_priv="$(cat "$key")"
   client_pub="$(cat "$pub")"
-  server_pub="$(cat "$SERVER_PUB")"
+  # Use auto-detected server public key, or fall back to file
+  if [[ -n "$SERVER_PUB_KEY" ]]; then
+    server_pub="$SERVER_PUB_KEY"
+  else
+    server_pub="$(cat "$SERVER_PUB")"
+  fi
 
   # Append peer (with trailing newline for clean formatting)
   cat >> "$WG_CONF" <<EOP
@@ -140,17 +277,17 @@ cmd_show() {
   echo "== wg show =="
   wg show
   echo
-  echo "== listening sockets (51820) =="
-  ss -lunp | grep -E ":(51820)\\b" || true
+  echo "== listening sockets (${SERVER_PORT}) =="
+  ss -lunp | grep -E ":(${SERVER_PORT})\\b" || true
 }
 
 cmd_list() {
   need_root list "$@"
   ensure_prereqs
-  echo "== Clients (configs) =="
+  echo "== Clients (configs in ${CLIENT_DIR}) =="
   ls -1 "$CLIENT_DIR"/*.conf 2>/dev/null | sed "s|^| - |" || echo " (none yet)"
   echo
-  echo "== Peers in wg0.conf =="
+  echo "== Peers in ${WG_IFACE}.conf =="
   awk '
     /^\[Peer\]/ {
       # Print previous peer if we had one
@@ -197,7 +334,7 @@ cmd_revoke() {
   local pk
   pk="$(cat "$pub")"
 
-  # Remove peer block from wg0.conf matching this PublicKey
+  # Remove peer block from config matching this PublicKey
   cp -a "$WG_CONF" "${WG_CONF}.bak_revoke_$(date +%Y%m%d_%H%M%S)"
   awk -v pk="$pk" '
     BEGIN {
@@ -264,13 +401,13 @@ cmd_revoke_orphan() {
     exit 1
   fi
 
-  # Check if peer exists in wg0.conf
+  # Check if peer exists in config
   if ! grep -q "PublicKey *= *${pubkey}" "$WG_CONF" 2>/dev/null; then
-    echo "Peer not found in wg0.conf"
+    echo "Peer not found in ${WG_CONF}"
     exit 1
   fi
 
-  # Remove peer block from wg0.conf matching this PublicKey
+  # Remove peer block from config matching this PublicKey
   cp -a "$WG_CONF" "${WG_CONF}.bak_revoke_$(date +%Y%m%d_%H%M%S)"
   awk -v pk="$pubkey" '
     BEGIN {
@@ -330,9 +467,19 @@ Commands:
   revoke-orphan <pubkey>    Remove orphan peer by public key (no config files)
   show                      Show wireguard status
 
+Current configuration (auto-detected):
+  Interface:   ${WG_IFACE}
+  Config:      ${WG_CONF}
+  Clients dir: ${CLIENT_DIR}
+  Subnet:      ${VPN_PREFIX}.0/24
+  DNS:         ${DNS_IP}
+
+Environment variables:
+  WG_INTERFACE  Override auto-detected interface (e.g., WG_INTERFACE=wg1)
+
 Notes:
 - Default endpoint is detected public IP; override with a DNS name if you have one.
-- DNS for clients is ${DNS_IP} (Pi-hole over VPN).
+- DNS for clients defaults to the first IP in the subnet (${DNS_IP}).
 - Changes are applied live via 'wg syncconf' — existing clients stay connected.
 USAGE
 }
