@@ -200,7 +200,13 @@ cmd_revoke() {
   # Remove peer block from wg0.conf matching this PublicKey
   cp -a "$WG_CONF" "${WG_CONF}.bak_revoke_$(date +%Y%m%d_%H%M%S)"
   awk -v pk="$pk" '
-    BEGIN { skip = 0; blk = "" }
+    BEGIN {
+      skip = 0
+      blk = ""
+      # Escape regex special characters in the public key
+      # Base64 keys can contain + and / which are regex metacharacters
+      gsub(/[[\\.^$*+?(){}|]/, "\\\\&", pk)
+    }
     /^\[Peer\]/ {
       # Starting new peer block — flush previous if not skipping
       if (blk != "" && !skip) {
