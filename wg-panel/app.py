@@ -69,7 +69,7 @@ def get_app_version():
                     return f.read().strip()
             except Exception:
                 pass
-    return '4.2.0'  # Fallback default
+    return '5.0.0'  # Fallback default
 
 APP_VERSION = get_app_version()
 
@@ -2512,6 +2512,44 @@ TEMPLATE = '''
         .handshake-badge.stale {
             color: var(--warning);
         }
+
+        /* Toggle switch for settings */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 26px;
+        }
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .toggle-switch .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: var(--bg-tertiary);
+            border-radius: 26px;
+            transition: 0.3s;
+        }
+        .toggle-switch .toggle-slider:before {
+            content: "";
+            position: absolute;
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+        .toggle-switch input:checked + .toggle-slider {
+            background: var(--accent);
+        }
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+        }
     </style>
 </head>
 <body>
@@ -2561,7 +2599,18 @@ TEMPLATE = '''
         <div class="flash success">{{ msg }}</div>
         {% endfor %}
         </div>
-        
+
+        <!-- Update notification banner -->
+        <div id="update-banner" style="display:none; background:linear-gradient(90deg, #f59e0b, #d97706); color:#000; padding:12px 20px; text-align:center; font-weight:500; border-radius:8px; margin-bottom:16px;">
+            <span id="update-message">A new version is available!</span>
+            <button onclick="showUpdateModal()" style="margin-left:15px; background:#000; color:#fff; border:none; padding:6px 16px; border-radius:4px; cursor:pointer;">
+                Update Now
+            </button>
+            <button onclick="dismissUpdateBanner()" style="margin-left:10px; background:transparent; border:1px solid #000; color:#000; padding:6px 12px; border-radius:4px; cursor:pointer;">
+                Later
+            </button>
+        </div>
+
         <div id="dashboard-content">
             <!-- Health Card -->
             <div class="health-card" id="healthCard" onclick="toggleHealthDetails()">
@@ -2785,6 +2834,28 @@ TEMPLATE = '''
                             <button type="submit" class="btn">Change Password</button>
                         </div>
                     </form>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
+                <div class="settings-section">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">Updates</h3>
+                    <div class="setting-item" style="margin-bottom:16px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <div>
+                                <label style="font-weight:500;">Automatic Updates</label>
+                                <p style="font-size:0.85em;color:var(--text-secondary);margin:4px 0 0 0;">
+                                    Automatically install updates daily at 3 AM
+                                </p>
+                            </div>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="auto-update-toggle" onchange="toggleAutoUpdate(this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item" style="display:flex;align-items:center;gap:12px;">
+                        <button onclick="manualCheckForUpdates()" class="btn btn-secondary btn-small">Check for Updates</button>
+                        <span id="current-version-display" style="color:var(--text-secondary);font-size:0.9em;">v{{ app_version }}</span>
+                    </div>
                 </div>
                 <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
                 <div class="settings-section">
@@ -3394,6 +3465,8 @@ TEMPLATE = '''
                 document.getElementById('settingsModal').classList.add('active');
                 // Load interface settings
                 loadInterfaces();
+                // Load auto-update setting
+                loadAutoUpdateSetting();
             }
 
             // Interface settings
@@ -4008,6 +4081,151 @@ TEMPLATE = '''
                 }
             }
 
+            // ===== Update Checking =====
+            let updateDismissedUntil = parseInt(localStorage.getItem('updateDismissedUntil') || '0');
+
+            async function checkForUpdates() {
+                // Don't check if user dismissed recently (24 hours)
+                if (Date.now() < updateDismissedUntil) return;
+
+                try {
+                    const data = await apiFetch('/api/updates/check').then(safeParseJSON);
+                    if (data && data.update_available) {
+                        document.getElementById('update-message').textContent =
+                            'LeathGuard v' + data.latest + ' is available (you have v' + data.current + ')';
+                        document.getElementById('update-banner').style.display = 'block';
+                    }
+                } catch (e) {
+                    console.log('Update check failed:', e);
+                }
+            }
+
+            function dismissUpdateBanner() {
+                document.getElementById('update-banner').style.display = 'none';
+                // Don't show again for 24 hours
+                const dismissUntil = Date.now() + 86400000;
+                localStorage.setItem('updateDismissedUntil', dismissUntil.toString());
+                updateDismissedUntil = dismissUntil;
+            }
+
+            function showUpdateModal() {
+                const modal = document.createElement('div');
+                modal.id = 'update-modal';
+                modal.innerHTML = `
+                    <div style="position:fixed;inset:0;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;z-index:1000;">
+                        <div style="background:var(--bg-secondary);border-radius:12px;padding:24px;max-width:500px;width:90%;">
+                            <h2 style="margin:0 0 16px 0;">Update Available</h2>
+                            <p>A new version of LeathGuard is available.</p>
+                            <p style="color:var(--text-secondary);font-size:0.9em;margin:16px 0;">
+                                The update will be applied and the service will restart automatically.
+                                You may be logged out and need to refresh the page.
+                            </p>
+                            <div id="update-progress" style="display:none;margin:16px 0;">
+                                <div style="background:var(--bg-tertiary);border-radius:4px;overflow:hidden;">
+                                    <div id="update-progress-bar" style="background:var(--accent);height:4px;width:0%;transition:width 0.3s;"></div>
+                                </div>
+                                <p id="update-status" style="font-size:0.85em;color:var(--text-secondary);margin-top:8px;">Starting update...</p>
+                            </div>
+                            <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:20px;">
+                                <button onclick="closeUpdateModal()" style="background:var(--bg-tertiary);border:none;padding:10px 20px;border-radius:6px;cursor:pointer;color:var(--text-primary);">Cancel</button>
+                                <button id="apply-update-btn" onclick="applyUpdate()" style="background:var(--accent);border:none;padding:10px 20px;border-radius:6px;cursor:pointer;color:#000;font-weight:500;">Apply Update</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+            }
+
+            function closeUpdateModal() {
+                const modal = document.getElementById('update-modal');
+                if (modal) modal.remove();
+            }
+
+            async function applyUpdate() {
+                const btn = document.getElementById('apply-update-btn');
+                const progress = document.getElementById('update-progress');
+                const progressBar = document.getElementById('update-progress-bar');
+                const status = document.getElementById('update-status');
+
+                btn.disabled = true;
+                btn.textContent = 'Updating...';
+                progress.style.display = 'block';
+
+                // Simulate progress
+                let pct = 0;
+                const progressInterval = setInterval(() => {
+                    pct = Math.min(pct + 10, 90);
+                    progressBar.style.width = pct + '%';
+                }, 500);
+
+                try {
+                    const data = await apiFetch('/api/updates/apply', {
+                        method: 'POST',
+                        headers: {'X-CSRF-Token': CSRF_TOKEN}
+                    }).then(safeParseJSON);
+                    clearInterval(progressInterval);
+
+                    if (data && data.success) {
+                        progressBar.style.width = '100%';
+                        status.textContent = 'Update complete! Restarting service...';
+
+                        // Wait for service to restart, then reload
+                        setTimeout(() => {
+                            status.textContent = 'Reloading page...';
+                            setTimeout(() => location.reload(), 2000);
+                        }, 3000);
+                    } else {
+                        throw new Error(data?.error || 'Update failed');
+                    }
+                } catch (e) {
+                    clearInterval(progressInterval);
+                    status.textContent = 'Error: ' + e.message;
+                    status.style.color = '#ff6b6b';
+                    btn.disabled = false;
+                    btn.textContent = 'Retry';
+                }
+            }
+
+            // Auto-update settings
+            async function loadAutoUpdateSetting() {
+                try {
+                    const data = await apiFetch('/api/settings/auto-update').then(safeParseJSON);
+                    if (data) {
+                        document.getElementById('auto-update-toggle').checked = data.enabled;
+                    }
+                } catch (e) {
+                    console.log('Failed to load auto-update setting:', e);
+                }
+            }
+
+            async function toggleAutoUpdate(enabled) {
+                try {
+                    const data = await apiFetch('/api/settings/auto-update', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
+                        body: JSON.stringify({enabled})
+                    }).then(safeParseJSON);
+
+                    if (data && data.success) {
+                        // Show toast notification if available
+                        console.log(enabled ? 'Auto-updates enabled' : 'Auto-updates disabled');
+                    }
+                } catch (e) {
+                    console.error('Failed to toggle auto-update:', e);
+                }
+            }
+
+            function manualCheckForUpdates() {
+                // Reset dismissal and check
+                updateDismissedUntil = 0;
+                localStorage.removeItem('updateDismissedUntil');
+                checkForUpdates().then(() => {
+                    if (document.getElementById('update-banner').style.display === 'none') {
+                        alert('You are running the latest version.');
+                    }
+                });
+            }
+
             // ===== Initial Load =====
             try {
                 refreshDashboard();
@@ -4016,6 +4234,9 @@ TEMPLATE = '''
             } catch (e) {
                 console.error('Initial load error:', e);
             }
+
+            // Check for updates after 5 seconds
+            setTimeout(checkForUpdates, 5000);
 
             // Auto-refresh intervals
             setInterval(() => {
@@ -4314,6 +4535,152 @@ def api_set_interface():
     except Exception as e:
         logger.error(f"Failed to save interface preference: {e}")
         return jsonify({'error': 'Failed to save interface preference'}), 500
+
+# --------------- Update Checking ---------------
+
+# Cache update check results (check at most once per hour)
+_update_cache = {'checked_at': 0, 'latest': None, 'update_available': False}
+UPDATE_CHECK_INTERVAL = 3600  # 1 hour
+
+
+def version_compare(v1, v2):
+    """Compare semantic versions. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+    def parse(v):
+        return [int(x) for x in v.split('.') if x.isdigit()]
+
+    p1, p2 = parse(v1), parse(v2)
+    for i in range(max(len(p1), len(p2))):
+        n1 = p1[i] if i < len(p1) else 0
+        n2 = p2[i] if i < len(p2) else 0
+        if n1 > n2:
+            return 1
+        if n1 < n2:
+            return -1
+    return 0
+
+
+def check_for_updates():
+    """Check GitHub for newer version."""
+    global _update_cache
+    import urllib.request
+
+    now = time.time()
+    if now - _update_cache['checked_at'] < UPDATE_CHECK_INTERVAL:
+        return _update_cache
+
+    try:
+        # Fetch latest release from GitHub API
+        url = "https://api.github.com/repos/bel52/wireguard-panel/releases/latest"
+        req = urllib.request.Request(url, headers={'User-Agent': 'LeathGuard'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            latest_version = data.get('tag_name', '').lstrip('v')
+
+            # Compare versions
+            current = APP_VERSION
+            update_available = version_compare(latest_version, current) > 0
+
+            _update_cache = {
+                'checked_at': now,
+                'latest': latest_version,
+                'current': current,
+                'update_available': update_available,
+                'release_url': data.get('html_url', ''),
+                'release_notes': (data.get('body', '') or '')[:500]  # Truncate
+            }
+    except Exception as e:
+        logger.warning(f"Update check failed: {e}")
+        _update_cache['checked_at'] = now  # Don't retry immediately
+
+    return _update_cache
+
+
+@app.route('/api/updates/check')
+@login_required
+def api_check_updates():
+    """Check for available updates."""
+    return jsonify(check_for_updates())
+
+
+@app.route('/api/updates/apply', methods=['POST'])
+@login_required
+@csrf_required
+def api_apply_update():
+    """Trigger update process."""
+    try:
+        # Run update.sh in background
+        result = subprocess.run(
+            ['/opt/wg-panel/update.sh', '--no-restart'],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if result.returncode == 0:
+            return jsonify({
+                'success': True,
+                'message': 'Update applied. Service will restart.',
+                'output': result.stdout
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': result.stderr or 'Update failed',
+                'output': result.stdout
+            }), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Update timed out'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/settings/auto-update', methods=['GET', 'POST'])
+@login_required
+@csrf_required
+def api_auto_update():
+    """Get or set auto-update preference."""
+    conn = get_db()
+
+    if request.method == 'GET':
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'auto_update_enabled'"
+        ).fetchone()
+        enabled = row[0] == '1' if row else False
+        conn.close()
+        return jsonify({'enabled': enabled})
+
+    else:  # POST
+        data = request.get_json()
+        enabled = data.get('enabled', False) if data else False
+
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('auto_update_enabled', ?, datetime('now'))",
+            ('1' if enabled else '0',)
+        )
+        conn.commit()
+        conn.close()
+
+        # Update cron job
+        cron_file = '/etc/cron.d/leathguard-autoupdate'
+        try:
+            if enabled:
+                cron_content = """# LeathGuard auto-update
+# Runs daily at 3 AM
+0 3 * * * root /opt/wg-panel/update.sh >> /var/log/leathguard-update.log 2>&1
+"""
+                with open(cron_file, 'w') as f:
+                    f.write(cron_content)
+                os.chmod(cron_file, 0o644)
+                logger.info("Auto-update enabled")
+            else:
+                if os.path.exists(cron_file):
+                    os.remove(cron_file)
+                logger.info("Auto-update disabled")
+        except Exception as e:
+            logger.warning(f"Failed to update cron job: {e}")
+
+        return jsonify({'success': True, 'enabled': enabled})
+
 
 @app.route('/add', methods=['POST'])
 @login_required

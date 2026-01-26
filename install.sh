@@ -42,17 +42,22 @@ PASS_HASH=$(echo -n "$WG_PASS" | sha256sum | cut -d' ' -f1)
 echo
 
 # Install dependencies
-echo "[1/7] Installing dependencies..."
+echo "[1/8] Installing dependencies..."
 apt-get update -qq
 apt-get install -y python3 python3-venv python3-pip qrencode >/dev/null 2>&1
 
 # Install wg-tool
-echo "[2/7] Installing wg-tool CLI..."
+echo "[2/8] Installing wg-tool CLI..."
 cp "$SCRIPT_DIR/wg-tool" /usr/local/sbin/wg-tool
 chmod 755 /usr/local/sbin/wg-tool
 
+# Install leathguard global CLI
+echo "[3/8] Installing leathguard CLI..."
+cp "$SCRIPT_DIR/leathguard" /usr/local/bin/leathguard
+chmod +x /usr/local/bin/leathguard
+
 # Create install directory
-echo "[3/7] Setting up web panel..."
+echo "[4/8] Setting up web panel..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/wg-panel/app.py" "$INSTALL_DIR/app.py"
 # Copy VERSION file for semantic versioning
@@ -61,7 +66,7 @@ if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
 fi
 
 # Create virtual environment
-echo "[4/7] Creating Python environment..."
+echo "[5/8] Creating Python environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet flask
@@ -89,7 +94,7 @@ if [[ -n "$WG_IFACE" ]]; then
 fi
 
 # Install systemd service
-echo "[5/7] Configuring systemd service..."
+echo "[6/8] Configuring systemd service..."
 cat > /etc/systemd/system/wg-panel.service <<EOF
 [Unit]
 Description=LeathGuard Web Panel
@@ -117,7 +122,7 @@ systemctl enable wg-panel >/dev/null 2>&1
 systemctl restart wg-panel
 
 # Firewall
-echo "[6/7] Configuring firewall..."
+echo "[7/8] Configuring firewall..."
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow "$PORT/tcp" >/dev/null 2>&1
     echo "    UFW: Opened port $PORT/tcp"
@@ -126,7 +131,7 @@ else
 fi
 
 # Setup update alias
-echo "[7/7] Setting up update alias..."
+echo "[8/8] Setting up update alias..."
 ALIAS_LINE="alias wgdeploy='cd $INSTALL_DIR && sudo ./update.sh'"
 
 # Add to root's bashrc if not present
@@ -169,8 +174,9 @@ echo "Username:   $WG_USER"
 echo "Password:   (as entered)"
 echo
 echo "Quick commands:"
-echo "   wgdeploy                          # Update to latest version"
-echo "   ./status.sh                       # Check installation status"
+echo "   leathguard status                 # Check installation status"
+echo "   leathguard update                 # Update to latest version"
+echo "   leathguard logs -f                # Follow service logs"
 echo "   sudo wg-tool --help               # Manage WireGuard clients"
 echo
 echo "Service management:"
