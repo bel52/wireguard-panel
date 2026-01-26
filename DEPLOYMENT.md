@@ -53,7 +53,13 @@ The installer will:
 
 ## Updating
 
-After installation, use the `wgdeploy` alias from anywhere:
+The recommended way to update is with the `leathguard` CLI (available from anywhere):
+
+```bash
+sudo leathguard update
+```
+
+Or use the legacy `wgdeploy` alias:
 
 ```bash
 wgdeploy
@@ -124,7 +130,7 @@ The panel auto-detects SERVER_PORT, DNS, and subnet from the interface config.
 
 | File | Location | Purpose |
 |------|----------|---------|
-| Web panel | `/opt/wg-panel/app.py` | Main Flask application |
+| Web panel | `/opt/wg-panel/wg-panel/app.py` | Main Flask application |
 | Database | `/opt/wg-panel/wg-panel.db` | SQLite (notes, history, settings) |
 | wg-tool | `/usr/local/sbin/wg-tool` | CLI management tool |
 | Service | `/etc/systemd/system/wg-panel.service` | Systemd unit file |
