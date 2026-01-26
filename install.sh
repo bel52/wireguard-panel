@@ -55,6 +55,10 @@ chmod 755 /usr/local/sbin/wg-tool
 echo "[3/6] Setting up web panel..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/wg-panel/app.py" "$INSTALL_DIR/app.py"
+# Copy VERSION file for semantic versioning
+if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
+    cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
+fi
 
 # Create virtual environment
 echo "[4/6] Creating Python environment..."

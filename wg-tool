@@ -196,9 +196,46 @@ apply_config() {
   fi
 }
 
+# Check if NAT rule exists for this subnet, create if missing
+check_nat_rule() {
+  local subnet="${VPN_PREFIX}.0/24"
+
+  # Try to detect the default outbound interface
+  local out_iface
+  out_iface=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
+  [[ -z "$out_iface" ]] && out_iface="eth0"  # Fallback
+
+  # Check if NAT rule exists (check both generic and interface-specific)
+  if iptables -t nat -C POSTROUTING -s "$subnet" -j MASQUERADE 2>/dev/null; then
+    return 0  # Rule exists (generic)
+  fi
+  if iptables -t nat -C POSTROUTING -s "$subnet" -o "$out_iface" -j MASQUERADE 2>/dev/null; then
+    return 0  # Rule exists (interface-specific)
+  fi
+
+  # NAT rule missing - create it
+  echo "Creating NAT rule for $subnet via $out_iface..." >&2
+  if iptables -t nat -A POSTROUTING -s "$subnet" -o "$out_iface" -j MASQUERADE; then
+    echo "NAT rule created successfully" >&2
+    # Try to persist (may fail if iptables-persistent not installed)
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save >/dev/null 2>&1; then
+      # Try to save to common locations
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+      iptables-save > /etc/iptables.rules 2>/dev/null || true
+    fi
+  else
+    echo "WARNING: Failed to create NAT rule. Clients may not have internet access." >&2
+  fi
+}
+
 cmd_add() {
   need_root add "$@"
   ensure_prereqs
+
+  # Ensure NAT rule exists for this subnet
+  check_nat_rule
 
   local name="${1:-}"
   [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip]"; exit 1; }
