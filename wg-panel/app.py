@@ -2732,7 +2732,6 @@ TEMPLATE = '''
                 <span class="demo-pill" id="demoPill">Demo Mode</span>
                 <span class="refresh-indicator"><span class="dot"></span> Live</span>
                 <button class="btn" onclick="showAddModal()">+ Add Client</button>
-                <button class="btn btn-secondary" onclick="showHistoryModal()">History</button>
                 <button class="demo-toggle" id="demoToggle" onclick="toggleDemoMode()">Demo</button>
                 <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
                 <button class="btn btn-secondary" onclick="showSettingsModal()" title="Settings">⚙️</button>
@@ -2830,7 +2829,10 @@ TEMPLATE = '''
             <div class="activity-section" id="activitySection">
                 <div class="activity-header">
                     <span class="activity-title">Recent Activity</span>
-                    <span class="activity-count" id="activityCount"></span>
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span class="activity-count" id="activityCount"></span>
+                        <a href="#" onclick="showHistoryModal(); return false;" style="color:var(--accent);font-size:0.85em;">View All</a>
+                    </div>
                 </div>
                 <div class="activity-list" id="activityList">
                     <div class="activity-row">Loading activity...</div>
@@ -2918,7 +2920,7 @@ TEMPLATE = '''
         
         <div class="modal" id="historyModal">
             <div class="modal-content">
-                <h2>Connection History</h2>
+                <h2>All Activity</h2>
                 <div class="history-list" id="historyList"></div>
                 <div class="form-actions">
                     <button class="btn btn-secondary" onclick="hideModals()">Close</button>
@@ -3035,6 +3037,19 @@ TEMPLATE = '''
                 </div>
                 <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
                 <div class="settings-section">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">Service Management</h3>
+                    <p style="font-size:0.85em;color:var(--text-secondary);margin-bottom:12px;">
+                        Restart the LeathGuard service. This will briefly disconnect VPN monitoring but won't affect active VPN connections.
+                    </p>
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <button onclick="restartService()" class="btn btn-secondary" style="background:var(--warning);border-color:var(--warning);color:#000;">
+                            Restart Service
+                        </button>
+                        <span id="restartStatus" style="font-size:0.85em;"></span>
+                    </div>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
+                <div class="settings-section">
                     <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">About</h3>
                     <div style="color:var(--text-secondary);font-size:0.9em;">
                         <p><strong>LeathGuard</strong> v{{ app_version }}</p>
@@ -3045,6 +3060,44 @@ TEMPLATE = '''
                     <button type="button" class="btn btn-secondary" onclick="hideModals()">Close</button>
                 </div>
                 <div id="settingsMessage" style="display:none;margin-top:15px;padding:10px;border-radius:8px;text-align:center;"></div>
+            </div>
+        </div>
+
+        <div class="modal" id="dnsModal">
+            <div class="modal-content">
+                <h2>DNS Settings</h2>
+                <p>Client: <strong id="dnsClientName"></strong></p>
+
+                <div style="margin:16px 0;">
+                    <label style="display:block;margin-bottom:8px;color:var(--text-secondary);">Current DNS</label>
+                    <span id="clientCurrentDns" style="font-family:monospace;color:var(--text-primary);">Loading...</span>
+                </div>
+
+                <div style="margin:16px 0;">
+                    <label style="display:block;margin-bottom:8px;color:var(--text-secondary);">Change DNS</label>
+                    <select id="clientDnsPreset" onchange="toggleCustomDnsInput('client')"
+                            style="width:100%;padding:10px;border-radius:6px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);">
+                        <option value="pihole">Pi-hole (Server) - Ad-blocking</option>
+                        <option value="google">Google (8.8.8.8)</option>
+                        <option value="cloudflare">Cloudflare (1.1.1.1) - Fast</option>
+                        <option value="cloudflare-family">Cloudflare Family - Blocks adult content</option>
+                        <option value="quad9">Quad9 (9.9.9.9) - Security-focused</option>
+                        <option value="custom">Custom...</option>
+                    </select>
+                    <div id="clientCustomDnsInput" style="display:none;margin-top:8px;">
+                        <input type="text" id="clientCustomDnsValue" placeholder="e.g., 8.8.8.8, 8.8.4.4"
+                               style="width:100%;padding:10px;border-radius:6px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);">
+                    </div>
+                </div>
+
+                <p style="font-size:0.85em;color:var(--text-muted);margin:12px 0;">
+                    After regenerating, the client must re-scan the QR code or re-import their config file.
+                </p>
+
+                <div class="form-actions">
+                    <button class="btn btn-secondary" onclick="hideModals()">Cancel</button>
+                    <button class="btn btn-primary" onclick="regenerateClientConfig(currentDnsClient)">Regenerate Config</button>
+                </div>
             </div>
         </div>
 
@@ -3322,13 +3375,26 @@ TEMPLATE = '''
                 }
             }
 
+            // ===== DNS Settings Modal =====
+            let currentDnsClient = null;
+
+            function showDnsSettings(clientName) {
+                currentDnsClient = clientName;
+                document.getElementById('dnsClientName').textContent = clientName;
+                document.getElementById('clientCurrentDns').textContent = 'Loading...';
+                document.getElementById('dnsModal').classList.add('active');
+
+                // Load current DNS settings
+                loadClientDns(clientName);
+            }
+
             async function regenerateClientConfig(clientName) {
                 const presetSelect = document.getElementById('clientDnsPreset');
                 const customInput = document.getElementById('clientCustomDnsValue');
                 const preset = presetSelect ? presetSelect.value : 'pihole';
                 const custom = customInput ? customInput.value : '';
 
-                if (!confirm(`Regenerate config for ${clientName}?\\n\\nThe client will need to re-scan the QR code or re-import their config file.`)) {
+                if (!confirm(`Regenerate config for ${clientName}?\n\nThe client will need to re-scan the QR code or re-import their config file.`)) {
                     return;
                 }
 
@@ -3349,11 +3415,13 @@ TEMPLATE = '''
 
                     if (data.success) {
                         alert(data.message);
+                        hideModals();
                         // Refresh the QR code if QR modal is open
                         const qrModal = document.getElementById('qrModal');
                         if (qrModal && qrModal.classList.contains('active')) {
                             showQR(clientName);
                         }
+                        refreshDashboard();
                     } else {
                         alert('Error: ' + (data.error || 'Failed to regenerate config'));
                     }
@@ -3478,22 +3546,35 @@ TEMPLATE = '''
                 const date = new Date(timestamp.replace(' ', 'T') + 'Z');
                 const now = new Date();
                 const diffMs = now - date;
+
+                // Calculate day difference using date boundaries (not just 24h periods)
+                const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+                const eventDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
                 const diffDay = Math.floor(diffMs / (24 * 60 * 60 * 1000));
 
                 // Format actual time for display
-                const timeStr = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                const timeStr = date.toLocaleTimeString('en-US', {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                    hour12: true
+                });
 
                 // If showActualTime is true, always show the actual timestamp
                 if (showActualTime) {
-                    if (diffDay === 0) {
+                    if (eventDate.getTime() === today.getTime()) {
                         return timeStr;  // Today: "10:31 PM"
-                    } else if (diffDay === 1) {
-                        return `Yesterday ${timeStr}`;
-                    } else if (diffDay < 7) {
-                        const dayName = date.toLocaleDateString([], { weekday: 'short' });
-                        return `${dayName} ${timeStr}`;  // "Mon 10:31 PM"
+                    } else if (eventDate.getTime() === yesterday.getTime()) {
+                        return `Yesterday, ${timeStr}`;  // "Yesterday, 10:31 PM"
                     } else {
-                        return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + timeStr;
+                        // Older: show date and time (e.g., "Jan 26, 10:31 PM")
+                        const dateStr = date.toLocaleDateString('en-US', {
+                            month: 'short',
+                            day: 'numeric'
+                        });
+                        return `${dateStr}, ${timeStr}`;
                     }
                 }
 
@@ -4205,6 +4286,7 @@ TEMPLATE = '''
                             <button class="icon-btn" onclick="showConfig('${c.name}')" title="Config">📄</button>
                             <a href="/download/${c.name}" class="icon-btn" title="Download">⬇️</a>
                             <button class="icon-btn" onclick="showNote('${c.name}', '${(c.note || '').replace(/'/g, "\\'")}')" title="Edit Note">✏️</button>
+                            <button class="icon-btn" onclick="showDnsSettings('${c.name}')" title="DNS Settings">⚙️</button>
                             <button class="icon-btn danger" onclick="confirmRevoke('${c.name}', '${c.public_key}')" title="Revoke">🗑️</button>
                         </div>
                     </div>
@@ -4543,6 +4625,38 @@ TEMPLATE = '''
                         alert('You are running the latest version.');
                     }
                 });
+            }
+
+            async function restartService() {
+                if (!confirm('Restart LeathGuard service?\n\nThe dashboard will be unavailable for a few seconds.')) {
+                    return;
+                }
+
+                const statusSpan = document.getElementById('restartStatus');
+                statusSpan.textContent = 'Restarting...';
+                statusSpan.style.color = 'var(--warning)';
+
+                try {
+                    await apiFetch('/api/service/restart', {
+                        method: 'POST',
+                        headers: {'X-CSRF-Token': CSRF_TOKEN}
+                    });
+
+                    // Service will restart, so we won't get a response
+                    // Wait and reload the page
+                    statusSpan.textContent = 'Service restarting, reloading page...';
+
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 3000);
+
+                } catch (err) {
+                    // Expected - service restarts before responding
+                    statusSpan.textContent = 'Restarting, please wait...';
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 3000);
+                }
             }
 
             // ===== Initial Load =====
@@ -5089,7 +5203,7 @@ def api_check_updates():
 def api_apply_update():
     """Trigger update process."""
     try:
-        # Run update.sh in background
+        # Run update.sh without restart first (so we can respond)
         result = subprocess.run(
             ['/opt/wg-panel/update.sh', '--no-restart'],
             capture_output=True,
@@ -5098,9 +5212,17 @@ def api_apply_update():
         )
 
         if result.returncode == 0:
+            # Schedule restart in background after response is sent
+            # Sleep gives time for HTTP response to complete
+            subprocess.Popen(
+                ['bash', '-c', 'sleep 2 && systemctl restart wg-panel'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True  # Detach from parent process
+            )
             return jsonify({
                 'success': True,
-                'message': 'Update applied. Service will restart.',
+                'message': 'Update applied. Service restarting...',
                 'output': result.stdout
             })
         else:
@@ -5113,6 +5235,28 @@ def api_apply_update():
         return jsonify({'success': False, 'error': 'Update timed out'}), 500
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/service/restart', methods=['POST'])
+@login_required
+@csrf_required
+def api_restart_service():
+    """Restart the wg-panel service."""
+    try:
+        # Spawn restart in background so we can respond first
+        subprocess.Popen(
+            ['bash', '-c', 'sleep 1 && systemctl restart wg-panel'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return jsonify({
+            'success': True,
+            'message': 'Service restart initiated'
+        })
+    except Exception as e:
+        logger.error(f"Failed to restart service: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/settings/auto-update', methods=['GET', 'POST'])
