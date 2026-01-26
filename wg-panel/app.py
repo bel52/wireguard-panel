@@ -4737,8 +4737,9 @@ def logout():
 @login_required
 def api_status():
     # Determine if interface was auto-selected from multiple
+    # Note: available_interfaces is NOT fetched here to avoid blocking the status API
+    # It's only fetched in /api/settings/interfaces when user opens settings
     auto_selected = WG_INTERFACE_SOURCE == 'auto-multiple'
-    available_interfaces = detect_wireguard_interfaces() if auto_selected else []
 
     return jsonify({
         'stats': get_server_stats(),
@@ -4746,8 +4747,7 @@ def api_status():
         'interface': {
             'current': WG_INTERFACE,
             'source': WG_INTERFACE_SOURCE,
-            'auto_selected': auto_selected,
-            'available': available_interfaces
+            'auto_selected': auto_selected
         }
     })
 
