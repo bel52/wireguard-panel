@@ -42,17 +42,17 @@ PASS_HASH=$(echo -n "$WG_PASS" | sha256sum | cut -d' ' -f1)
 echo
 
 # Install dependencies
-echo "[1/6] Installing dependencies..."
+echo "[1/7] Installing dependencies..."
 apt-get update -qq
 apt-get install -y python3 python3-venv python3-pip qrencode >/dev/null 2>&1
 
 # Install wg-tool
-echo "[2/6] Installing wg-tool CLI..."
+echo "[2/7] Installing wg-tool CLI..."
 cp "$SCRIPT_DIR/wg-tool" /usr/local/sbin/wg-tool
 chmod 755 /usr/local/sbin/wg-tool
 
 # Create install directory
-echo "[3/6] Setting up web panel..."
+echo "[3/7] Setting up web panel..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/wg-panel/app.py" "$INSTALL_DIR/app.py"
 # Copy VERSION file for semantic versioning
@@ -61,7 +61,7 @@ if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
 fi
 
 # Create virtual environment
-echo "[4/6] Creating Python environment..."
+echo "[4/7] Creating Python environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet flask
@@ -89,7 +89,7 @@ if [[ -n "$WG_IFACE" ]]; then
 fi
 
 # Install systemd service
-echo "[5/6] Configuring systemd service..."
+echo "[5/7] Configuring systemd service..."
 cat > /etc/systemd/system/wg-panel.service <<EOF
 [Unit]
 Description=LeathGuard Web Panel
@@ -117,7 +117,7 @@ systemctl enable wg-panel >/dev/null 2>&1
 systemctl restart wg-panel
 
 # Firewall
-echo "[6/6] Configuring firewall..."
+echo "[6/7] Configuring firewall..."
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow "$PORT/tcp" >/dev/null 2>&1
     echo "    UFW: Opened port $PORT/tcp"
@@ -125,24 +125,59 @@ else
     echo "    UFW not active (ensure cloud firewall allows port $PORT)"
 fi
 
+# Setup update alias
+echo "[7/7] Setting up update alias..."
+ALIAS_LINE="alias wgdeploy='cd $INSTALL_DIR && sudo ./update.sh'"
+
+# Add to root's bashrc if not present
+if ! grep -q "alias wgdeploy=" /root/.bashrc 2>/dev/null; then
+    {
+        echo ""
+        echo "# LeathGuard update alias"
+        echo "$ALIAS_LINE"
+    } >> /root/.bashrc
+    echo "    Added wgdeploy alias to /root/.bashrc"
+fi
+
+# Add to invoking user's bashrc if running via sudo
+if [[ -n "$SUDO_USER" && "$SUDO_USER" != "root" ]]; then
+    USER_HOME=$(eval echo "~$SUDO_USER")
+    USER_BASHRC="$USER_HOME/.bashrc"
+    if [[ -f "$USER_BASHRC" ]] && ! grep -q "alias wgdeploy=" "$USER_BASHRC" 2>/dev/null; then
+        {
+            echo ""
+            echo "# LeathGuard update alias"
+            echo "$ALIAS_LINE"
+        } >> "$USER_BASHRC"
+        echo "    Added wgdeploy alias to $USER_BASHRC"
+    fi
+fi
+
 # Get server IP
 SERVER_IP=$(curl -sS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
 echo
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║           ✅ Installation Complete                        ║"
+echo "║           Installation Complete                           ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
 echo
-echo "📍 Web Panel:  http://$SERVER_IP:$PORT"
-echo "👤 Username:   $WG_USER"
-echo "🔑 Password:   (as entered)"
+VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "?")
+echo "LeathGuard v$VERSION is now running"
 echo
-echo "🛠  CLI Tool:   sudo wg-tool --help"
+echo "Web Panel:  http://$SERVER_IP:$PORT"
+echo "Username:   $WG_USER"
+echo "Password:   (as entered)"
 echo
-echo "📋 Commands:"
+echo "Quick commands:"
+echo "   wgdeploy                          # Update to latest version"
+echo "   ./status.sh                       # Check installation status"
+echo "   sudo wg-tool --help               # Manage WireGuard clients"
+echo
+echo "Service management:"
 echo "   sudo systemctl status wg-panel    # Check status"
 echo "   sudo journalctl -u wg-panel -f    # View logs"
 echo "   sudo systemctl restart wg-panel   # Restart"
 echo
-echo "⚠️  Don't forget to open port $PORT in your cloud firewall!"
+echo "Note: Open port $PORT in your cloud firewall if needed."
+echo "(Restart your shell or run 'source ~/.bashrc' to use wgdeploy)"
 echo
