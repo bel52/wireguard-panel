@@ -129,6 +129,40 @@ TRAFFIC_RING_BUFFER = deque(maxlen=17280)  # 24h at 5s intervals
 TRAFFIC_BUFFER_LOCK = threading.Lock()
 LAST_TRAFFIC_SAMPLE = {'rx': 0, 'tx': 0, 'time': 0}
 
+# DNS presets for per-client DNS configuration
+DNS_PRESETS = {
+    'pihole': {
+        'name': 'Pi-hole (Server)',
+        'dns': None,  # Will use server's DNS from wg config
+        'description': 'Ad-blocking via server Pi-hole'
+    },
+    'google': {
+        'name': 'Google',
+        'dns': '8.8.8.8, 8.8.4.4',
+        'description': 'Google Public DNS'
+    },
+    'cloudflare': {
+        'name': 'Cloudflare',
+        'dns': '1.1.1.1, 1.0.0.1',
+        'description': 'Cloudflare DNS (fast, privacy-focused)'
+    },
+    'cloudflare-family': {
+        'name': 'Cloudflare Family',
+        'dns': '1.1.1.3, 1.0.0.3',
+        'description': 'Cloudflare with malware + adult content blocking'
+    },
+    'quad9': {
+        'name': 'Quad9',
+        'dns': '9.9.9.9, 149.112.112.112',
+        'description': 'Quad9 (security-focused, blocks malware)'
+    },
+    'custom': {
+        'name': 'Custom',
+        'dns': '',
+        'description': 'Enter custom DNS servers'
+    }
+}
+
 # --------------- Database ---------------
 
 def get_db():
@@ -209,6 +243,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Per-client DNS configuration
+        CREATE TABLE IF NOT EXISTS client_dns (
+            name TEXT PRIMARY KEY,
+            dns_preset TEXT DEFAULT 'pihole',
+            dns_custom TEXT DEFAULT '',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -1507,15 +1549,39 @@ def log_connection_event(client_name, event_type, endpoint=''):
     conn.commit()
     conn.close()
 
-def add_client(name):
+def add_client(name, dns_preset='pihole', dns_custom=''):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return False, "Invalid name. Use only letters, numbers, underscore, dash."
     if len(name) > 32:
         return False, "Name too long (max 32 chars)."
-    
-    output, code = run_cmd(['wg-tool', 'add', name])
+
+    # Determine DNS value
+    dns_value = None
+    if dns_preset == 'custom' and dns_custom:
+        dns_value = dns_custom.strip()
+    elif dns_preset in DNS_PRESETS and DNS_PRESETS[dns_preset]['dns']:
+        dns_value = DNS_PRESETS[dns_preset]['dns']
+    # If dns_value is None, wg-tool will use the server default
+
+    # Build command
+    cmd = ['wg-tool', 'add', name]
+    if dns_value:
+        cmd.extend(['--dns', dns_value])
+
+    output, code = run_cmd(cmd)
     if code == 0:
         log_connection_event(name, 'created')
+        # Save DNS preference to database
+        try:
+            conn = get_db()
+            conn.execute('''
+                INSERT OR REPLACE INTO client_dns (name, dns_preset, dns_custom, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+            ''', (name, dns_preset, dns_custom))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to save DNS preference for {name}: {e}")
     return code == 0, output
 
 def revoke_client(name, pubkey=None):
@@ -2052,7 +2118,87 @@ TEMPLATE = '''
         .history-item .event.disconnected { color: var(--warning); }
         
         .login-container { max-width: 350px; margin: 80px auto; }
-        
+
+        /* Interface auto-selection banner */
+        .interface-banner {
+            background: linear-gradient(135deg, rgba(0,212,170,0.15), rgba(0,150,136,0.15));
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+        }
+        .interface-banner .banner-content {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+        }
+        .interface-banner .banner-icon {
+            font-size: 1.2em;
+        }
+        .interface-banner .banner-text {
+            flex: 1;
+            color: var(--text-primary);
+            font-size: 0.9em;
+        }
+        .interface-banner .banner-text a {
+            color: var(--accent);
+            text-decoration: underline;
+            cursor: pointer;
+        }
+        .interface-banner .banner-text a:hover {
+            color: var(--accent-hover);
+        }
+        .interface-banner .banner-dismiss {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.5em;
+            cursor: pointer;
+            padding: 0 8px;
+            line-height: 1;
+        }
+        .interface-banner .banner-dismiss:hover {
+            color: var(--text-primary);
+        }
+
+        /* DNS selection styling */
+        .dns-select-group {
+            margin-top: 16px;
+        }
+        .dns-select-group select {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: var(--bg-primary);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-primary);
+            font-size: 0.95em;
+        }
+        .dns-select-group select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .dns-custom-input {
+            display: none;
+            margin-top: 8px;
+        }
+        .dns-custom-input input {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: var(--bg-primary);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-primary);
+            font-size: 0.95em;
+        }
+        .dns-custom-input small {
+            display: block;
+            margin-top: 4px;
+            color: var(--text-secondary);
+            font-size: 0.8em;
+        }
+
         .theme-toggle {
             background: var(--bg-tertiary);
             border: 1px solid rgba(255,255,255,0.1);
@@ -2611,6 +2757,18 @@ TEMPLATE = '''
             </button>
         </div>
 
+        <!-- Interface auto-selection banner -->
+        <div id="interfaceBanner" class="interface-banner" style="display:none;">
+            <div class="banner-content">
+                <span class="banner-icon">&#9881;</span>
+                <span class="banner-text">
+                    Multiple WireGuard interfaces detected. Using <strong id="bannerInterface"></strong>.
+                    <a onclick="showSettingsModal(); return false;">Change in Settings</a>
+                </span>
+                <button class="banner-dismiss" onclick="dismissInterfaceBanner()" title="Dismiss">&times;</button>
+            </div>
+        </div>
+
         <div id="dashboard-content">
             <!-- Health Card -->
             <div class="health-card" id="healthCard" onclick="toggleHealthDetails()">
@@ -2694,6 +2852,21 @@ TEMPLATE = '''
                     <div class="form-group">
                         <label>Note (optional)</label>
                         <input type="text" name="note" placeholder="e.g., Dad's laptop">
+                    </div>
+                    <div class="form-group dns-select-group">
+                        <label>DNS Server</label>
+                        <select name="dns_preset" id="newClientDnsPreset" onchange="toggleCustomDnsInput('new')">
+                            <option value="pihole">Pi-hole (Server) - Ad-blocking</option>
+                            <option value="google">Google (8.8.8.8) - Fast, reliable</option>
+                            <option value="cloudflare">Cloudflare (1.1.1.1) - Privacy-focused</option>
+                            <option value="cloudflare-family">Cloudflare Family - Blocks adult content</option>
+                            <option value="quad9">Quad9 (9.9.9.9) - Security-focused</option>
+                            <option value="custom">Custom...</option>
+                        </select>
+                        <div id="newClientCustomDns" class="dns-custom-input">
+                            <input type="text" name="dns_custom" placeholder="e.g., 8.8.8.8, 8.8.4.4">
+                            <small>Comma-separated IP addresses</small>
+                        </div>
                     </div>
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" onclick="hideModals()">Cancel</button>
@@ -3108,6 +3281,110 @@ TEMPLATE = '''
 
             // Initialize demo mode UI
             updateDemoModeUI();
+
+            // ===== Interface Auto-Selection Banner =====
+            function checkInterfaceBanner(statusData) {
+                const banner = document.getElementById('interfaceBanner');
+                if (!banner) return;
+
+                // Check if already dismissed this session
+                const dismissed = sessionStorage.getItem('interfaceBannerDismissed');
+                if (dismissed) {
+                    banner.style.display = 'none';
+                    return;
+                }
+
+                // Show banner if interface was auto-selected from multiple
+                if (statusData.interface && statusData.interface.auto_selected) {
+                    document.getElementById('bannerInterface').textContent = statusData.interface.current;
+                    banner.style.display = 'block';
+                } else {
+                    banner.style.display = 'none';
+                }
+            }
+
+            function dismissInterfaceBanner() {
+                const banner = document.getElementById('interfaceBanner');
+                if (banner) {
+                    banner.style.display = 'none';
+                    sessionStorage.setItem('interfaceBannerDismissed', 'true');
+                }
+            }
+
+            // ===== DNS Configuration =====
+            function toggleCustomDnsInput(prefix) {
+                const selectId = prefix === 'new' ? 'newClientDnsPreset' : 'clientDnsPreset';
+                const customInputId = prefix === 'new' ? 'newClientCustomDns' : 'clientCustomDnsInput';
+                const select = document.getElementById(selectId);
+                const customInput = document.getElementById(customInputId);
+                if (select && customInput) {
+                    customInput.style.display = select.value === 'custom' ? 'block' : 'none';
+                }
+            }
+
+            async function regenerateClientConfig(clientName) {
+                const presetSelect = document.getElementById('clientDnsPreset');
+                const customInput = document.getElementById('clientCustomDnsValue');
+                const preset = presetSelect ? presetSelect.value : 'pihole';
+                const custom = customInput ? customInput.value : '';
+
+                if (!confirm(`Regenerate config for ${clientName}?\\n\\nThe client will need to re-scan the QR code or re-import their config file.`)) {
+                    return;
+                }
+
+                try {
+                    const response = await apiFetch(`/api/clients/${encodeURIComponent(clientName)}/regenerate`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-Token': CSRF_TOKEN
+                        },
+                        body: JSON.stringify({
+                            dns_preset: preset,
+                            dns_custom: custom
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        alert(data.message);
+                        // Refresh the QR code if QR modal is open
+                        const qrModal = document.getElementById('qrModal');
+                        if (qrModal && qrModal.classList.contains('active')) {
+                            showQR(clientName);
+                        }
+                    } else {
+                        alert('Error: ' + (data.error || 'Failed to regenerate config'));
+                    }
+                } catch (err) {
+                    alert('Error: ' + err.message);
+                }
+            }
+
+            async function loadClientDns(clientName) {
+                try {
+                    const response = await apiFetch(`/api/clients/${encodeURIComponent(clientName)}/dns`);
+                    const data = await response.json();
+
+                    const presetSelect = document.getElementById('clientDnsPreset');
+                    const customInput = document.getElementById('clientCustomDnsValue');
+                    const currentDnsSpan = document.getElementById('clientCurrentDns');
+
+                    if (presetSelect) {
+                        presetSelect.value = data.dns_preset || 'pihole';
+                        toggleCustomDnsInput('client');
+                    }
+                    if (customInput) {
+                        customInput.value = data.dns_custom || '';
+                    }
+                    if (currentDnsSpan) {
+                        currentDnsSpan.textContent = data.current_dns || 'Server default';
+                    }
+                } catch (err) {
+                    console.error('Failed to load client DNS:', err);
+                }
+            }
 
             // ===== Map Collapse =====
             function toggleMap() {
@@ -4008,6 +4285,9 @@ TEMPLATE = '''
                         const geoCount = clients.filter(c => c.geo && c.geo.lat).length;
                         const connectedGeo = clients.filter(c => c.connected && c.geo && c.geo.lat).length;
                         document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
+
+                        // Check interface auto-selection and show banner if needed
+                        checkInterfaceBanner(data);
                     })
                     .catch(err => {
                         if (err.message === 'Session expired') return;  // Already handled by apiFetch
@@ -4342,9 +4622,19 @@ def logout():
 @app.route('/api/status')
 @login_required
 def api_status():
+    # Determine if interface was auto-selected from multiple
+    auto_selected = WG_INTERFACE_SOURCE == 'auto-multiple'
+    available_interfaces = detect_wireguard_interfaces() if auto_selected else []
+
     return jsonify({
         'stats': get_server_stats(),
-        'clients': get_clients()
+        'clients': get_clients(),
+        'interface': {
+            'current': WG_INTERFACE,
+            'source': WG_INTERFACE_SOURCE,
+            'auto_selected': auto_selected,
+            'available': available_interfaces
+        }
     })
 
 @app.route('/api/history')
@@ -4625,6 +4915,108 @@ def api_unlock_interface():
         logger.error(f"Failed to unlock interface: {e}")
         return jsonify({'error': f'Failed to unlock: {str(e)}'}), 500
 
+
+# --------------- Per-Client DNS Configuration ---------------
+
+@app.route('/api/dns-presets')
+@login_required
+def api_dns_presets():
+    """Get available DNS presets."""
+    return jsonify(DNS_PRESETS)
+
+
+@app.route('/api/clients/<name>/dns')
+@login_required
+def api_get_client_dns(name):
+    """Get DNS configuration for a specific client."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return jsonify({'error': 'Invalid client name'}), 400
+
+    # Get from database
+    conn = get_db()
+    row = conn.execute(
+        'SELECT dns_preset, dns_custom FROM client_dns WHERE name = ?',
+        (name,)
+    ).fetchone()
+    conn.close()
+
+    if row:
+        preset = row['dns_preset']
+        custom = row['dns_custom']
+    else:
+        preset = 'pihole'
+        custom = ''
+
+    # Also get current DNS from config file
+    current_dns = None
+    try:
+        conf_path = f'{WG_CLIENTS_DIR}/{name}.conf'
+        result = subprocess.run(['sudo', 'cat', conf_path],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if line.strip().startswith('DNS'):
+                    current_dns = line.split('=', 1)[1].strip() if '=' in line else None
+                    break
+    except Exception as e:
+        logger.debug(f"Could not read DNS from config: {e}")
+
+    return jsonify({
+        'name': name,
+        'dns_preset': preset,
+        'dns_custom': custom,
+        'current_dns': current_dns
+    })
+
+
+@app.route('/api/clients/<name>/regenerate', methods=['POST'])
+@login_required
+@csrf_required
+def api_regenerate_client(name):
+    """Regenerate client config with new DNS settings."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return jsonify({'error': 'Invalid client name'}), 400
+
+    data = request.get_json() or {}
+    dns_preset = data.get('dns_preset', 'pihole')
+    dns_custom = data.get('dns_custom', '').strip()
+
+    # Determine DNS value
+    dns_value = None
+    if dns_preset == 'custom' and dns_custom:
+        dns_value = dns_custom
+    elif dns_preset in DNS_PRESETS and DNS_PRESETS[dns_preset]['dns']:
+        dns_value = DNS_PRESETS[dns_preset]['dns']
+
+    # Build command
+    cmd = ['wg-tool', 'regen', name]
+    if dns_value:
+        cmd.extend(['--dns', dns_value])
+
+    output, code = run_cmd(cmd)
+
+    if code == 0:
+        # Update DNS preference in database
+        try:
+            conn = get_db()
+            conn.execute('''
+                INSERT OR REPLACE INTO client_dns (name, dns_preset, dns_custom, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+            ''', (name, dns_preset, dns_custom))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to save DNS preference for {name}: {e}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Config regenerated for {name}. Client must re-scan QR code or re-import config.',
+            'requires_reimport': True
+        })
+    else:
+        return jsonify({'error': output}), 400
+
+
 # --------------- Update Checking ---------------
 
 # Cache update check results (check at most once per hour)
@@ -4777,8 +5169,10 @@ def api_auto_update():
 def add():
     name = request.form.get('name', '').strip()
     note = request.form.get('note', '').strip()
+    dns_preset = request.form.get('dns_preset', 'pihole').strip()
+    dns_custom = request.form.get('dns_custom', '').strip()
     if name:
-        success, msg = add_client(name)
+        success, msg = add_client(name, dns_preset=dns_preset, dns_custom=dns_custom)
         if success:
             if note:
                 update_client_note(name, note)
