@@ -29,30 +29,37 @@ echo "Install path: $SCRIPT_DIR"
 # Git status
 echo ""
 echo -e "${CYAN}Git Status:${NC}"
-if git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null; then
-    # Fix safe.directory quietly
-    git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
 
-    BRANCH=$(git -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || echo "unknown")
-    COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Use sudo for git commands if not root (git dir often owned by root)
+GIT_CMD="git"
+if [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null; then
+    GIT_CMD="sudo git"
+fi
+
+if $GIT_CMD -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null; then
+    # Fix safe.directory quietly
+    $GIT_CMD config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
+
+    BRANCH=$($GIT_CMD -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || echo "unknown")
+    COMMIT=$($GIT_CMD -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "  Branch: $BRANCH"
     echo "  Commit: $COMMIT"
 
     # Check for local modifications
-    if ! git -C "$SCRIPT_DIR" diff --quiet 2>/dev/null; then
-        MOD_COUNT=$(git -C "$SCRIPT_DIR" diff --name-only 2>/dev/null | wc -l)
+    if ! $GIT_CMD -C "$SCRIPT_DIR" diff --quiet 2>/dev/null; then
+        MOD_COUNT=$($GIT_CMD -C "$SCRIPT_DIR" diff --name-only 2>/dev/null | wc -l)
         echo -e "  ${YELLOW}! Local modifications ($MOD_COUNT files)${NC}"
     fi
 
     # Check if behind remote (quietly fetch)
-    DEFAULT_BRANCH=$(git -C "$SCRIPT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
-    git -C "$SCRIPT_DIR" fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+    DEFAULT_BRANCH=$($GIT_CMD -C "$SCRIPT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+    $GIT_CMD -C "$SCRIPT_DIR" fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
 
-    LOCAL=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
-    REMOTE=$(git -C "$SCRIPT_DIR" rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+    LOCAL=$($GIT_CMD -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+    REMOTE=$($GIT_CMD -C "$SCRIPT_DIR" rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
 
     if [[ -n "$REMOTE" && "$LOCAL" != "$REMOTE" ]]; then
-        BEHIND=$(git -C "$SCRIPT_DIR" rev-list HEAD.."origin/$DEFAULT_BRANCH" --count 2>/dev/null || echo "?")
+        BEHIND=$($GIT_CMD -C "$SCRIPT_DIR" rev-list HEAD.."origin/$DEFAULT_BRANCH" --count 2>/dev/null || echo "?")
         echo -e "  ${YELLOW}! Behind origin/$DEFAULT_BRANCH by $BEHIND commit(s)${NC}"
     else
         echo -e "  ${GREEN}Up to date${NC}"

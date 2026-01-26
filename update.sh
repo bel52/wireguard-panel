@@ -147,13 +147,23 @@ fi
 # Update app.py if install directory exists
 INSTALL_DIR="/opt/wg-panel"
 if [[ -d "$INSTALL_DIR" ]]; then
+    # Copy app.py only if source and destination are different files
     if [[ -f "$SCRIPT_DIR/wg-panel/app.py" ]]; then
-        cp "$SCRIPT_DIR/wg-panel/app.py" "$INSTALL_DIR/app.py"
-        echo "  Copied app.py to $INSTALL_DIR/"
+        SRC="$SCRIPT_DIR/wg-panel/app.py"
+        DST="$INSTALL_DIR/app.py"
+        if [[ ! "$SRC" -ef "$DST" ]] 2>/dev/null; then
+            cp "$SRC" "$DST"
+            echo "  Synced app.py to $INSTALL_DIR/"
+        fi
     fi
+    # Copy VERSION only if source and destination are different files
     if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
-        cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
-        echo "  Copied VERSION to $INSTALL_DIR/"
+        SRC="$SCRIPT_DIR/VERSION"
+        DST="$INSTALL_DIR/VERSION"
+        if [[ ! "$SRC" -ef "$DST" ]] 2>/dev/null; then
+            cp "$SRC" "$DST"
+            echo "  Synced VERSION to $INSTALL_DIR/"
+        fi
     fi
 fi
 

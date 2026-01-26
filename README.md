@@ -1,345 +1,323 @@
 # LeathGuard
 
-A lightweight, self-hosted WireGuard VPN management solution with both CLI and web interfaces. Designed to be simple like PiVPN but with a modern web dashboard.
+A modern, self-hosted WireGuard VPN management panel with a beautiful dark-themed UI.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Ubuntu%2022.04%2B-orange.svg)
+![LeathGuard Dashboard](docs/screenshot.png)
 
 ## Features
 
-### CLI Tool (`wg-tool`)
-- **PiVPN-like simplicity** — add, revoke, list clients with single commands
-- **Live reload** — changes apply instantly via `wg syncconf` (no client disconnections)
-- **Auto IP assignment** — allocates next available IP in your subnet
-- **QR code generation** — for easy mobile setup
+- **Beautiful Dashboard** - Real-time client status, traffic stats, and connection map
+- **Easy Client Management** - Add, edit, revoke clients with QR code generation
+- **Multi-Interface Support** - Manage multiple WireGuard interfaces from one panel
+- **Automatic Updates** - In-app update notifications with one-click updates
+- **Auto-Update Option** - Optional automatic updates via cron (3 AM daily)
+- **Global CLI** - `leathguard` command works from anywhere
+- **Secure by Default** - Session-based auth, CSRF protection, password hashing
 
-### Web Panel (`wg-panel`)
-- **Realtime dashboard** — auto-refreshes every 5 seconds
-- **Connection status** — live connected/offline indicators with 5-minute threshold
-- **Connection duration** — shows how long each client has been connected
-- **Bandwidth monitoring** — per-client sparkline graphs showing live activity
-- **GeoIP location** — shows country/city for connected clients with map view
-- **Client management** — add, revoke, download configs, view QR codes
-- **Client notes** — add descriptions like "Dad's laptop"
-- **Connection history** — logs of all connect/disconnect/create/revoke events
-- **Dark/Light mode** — toggle with saved preference
-- **Mobile-friendly** — responsive design
-
-### v4 New Features
-- **Health & Risk Monitoring** — system health card showing WireGuard interface, IP forwarding, and NAT status
-- **Persistent Traffic Stats** — 1h/24h traffic windows survive restarts (stored in SQLite)
-- **Daily Usage Tracking** — per-client daily usage stats for historical reporting
-- **Parental Controls (Pause/Unpause)** — block internet for specific clients while keeping VPN connected (great for kids!)
-- **Demo-safe Mode** — one-click redaction of all sensitive IPs and locations for presentations
-- **Collapsible Map** — map collapsed by default, state persists in localStorage
-- **Enhanced Client Controls** — search, filter (All/Connected/Offline/Last 24h), and sort (Name/Handshake/RX/TX)
-- **Compact Actions** — icon buttons with tooltips, copy-to-clipboard for endpoints
-- **Recent Activity Section** — improved vertical layout with icons and friendly timestamps (below map)
-- **Friendly Timestamps** — "Last seen 5m ago" instead of raw ISO dates
-- **Last Handshake Badge** — prominent handshake indicator per client
-
-## Requirements
-
-### System Requirements
-- **OS:** Ubuntu 22.04 LTS or newer (tested on Ubuntu 24.04 LTS)
-- **Architecture:** x86_64 or ARM64
-- **RAM:** 512 MB minimum
-- **Disk:** 100 MB free space
+## Quick Start
 
 ### Prerequisites
-Before running the installer, you must have:
 
-1. **WireGuard installed and configured** with a working `wg0` interface:
-   ```bash
-   # Install WireGuard
-   sudo apt update
-   sudo apt install wireguard wireguard-tools
+- Ubuntu/Debian Linux (tested on Ubuntu 22.04, Debian 12, Raspberry Pi OS)
+- WireGuard installed and configured
+- Python 3.8+
+- Root access
 
-   # Verify installation
-   wg --version
-   ```
-
-2. **A working WireGuard server configuration** at `/etc/wireguard/wg0.conf`:
-   ```ini
-   [Interface]
-   PrivateKey = <your_server_private_key>
-   Address = 10.6.0.1/24
-   ListenPort = 51820
-   PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-   PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-   ```
-
-3. **Server keys generated**:
-   ```bash
-   # Generate server keys (if not already done)
-   cd /etc/wireguard
-   umask 077
-   wg genkey | tee server.key | wg pubkey > server.pub
-   ```
-
-4. **IP forwarding enabled**:
-   ```bash
-   # Enable IP forwarding
-   echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
-   sudo sysctl -p
-   ```
-
-5. **WireGuard interface running**:
-   ```bash
-   sudo systemctl enable wg-quick@wg0
-   sudo systemctl start wg-quick@wg0
-   sudo wg show  # Verify it's running
-   ```
-
-### Network Requirements
-- **UDP port 51820** open for WireGuard VPN traffic
-- **TCP port 5000** open for web panel (configurable)
-- Public IP or domain name for VPN endpoint
-
-## Installation
-
-### Quick Install
+### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/bel52/wireguard-panel.git
-cd wireguard-panel
+git clone https://github.com/bel52/wireguard-panel.git /opt/wg-panel
+cd /opt/wg-panel
 
-# Run installer (interactive - will prompt for credentials)
+# Run installer
 sudo ./install.sh
 ```
 
-### What the Installer Does
+The installer will:
+1. Install dependencies (Python, Flask, qrencode)
+2. Set up the `wg-tool` CLI for WireGuard management
+3. Install the `leathguard` global CLI
+4. Create a Python virtual environment
+5. Configure and start the systemd service
+6. Set up firewall rules (if UFW is active)
 
-1. Installs system dependencies:
-   - `python3`, `python3-venv`, `python3-pip`
-   - `qrencode` (for QR code generation)
+### First Login
 
-2. Installs `wg-tool` CLI to `/usr/local/sbin/wg-tool`
+After installation, access the panel at `http://your-server-ip:5000`
 
-3. Sets up the web panel:
-   - Creates `/opt/wg-panel/` directory
-   - Creates Python virtual environment
-   - Installs Flask web framework
-   - Initializes SQLite database for notes/history
+Default credentials are set during installation, or you can set them via environment variables:
+- `WG_PANEL_USER` - Username (default: admin)
+- `WG_PANEL_PASS` - Plain text password, OR
+- `WG_PANEL_PASS_HASH` - SHA256 hash of password
 
-4. Configures systemd service `wg-panel.service`
+## Usage
 
-5. Opens firewall port (if UFW is active)
+### Global CLI
 
-### Manual Installation
-
-If you prefer to install manually:
+LeathGuard installs a global `leathguard` command:
 
 ```bash
-# Install dependencies
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip qrencode
+# Check status
+leathguard status
 
-# Install CLI tool
-sudo cp wg-tool /usr/local/sbin/wg-tool
-sudo chmod 755 /usr/local/sbin/wg-tool
+# Update to latest version
+sudo leathguard update
 
-# Set up web panel
-sudo mkdir -p /opt/wg-panel
-sudo cp wg-panel/app.py /opt/wg-panel/
-sudo python3 -m venv /opt/wg-panel/venv
-sudo /opt/wg-panel/venv/bin/pip install flask
+# Check for updates without applying
+sudo leathguard check
 
-# Create systemd service (see install.sh for template)
-# Configure environment variables for authentication
+# View logs
+sudo leathguard logs 50      # Last 50 lines
+sudo leathguard logs -f      # Follow logs
+
+# Service management
+sudo leathguard restart
+sudo leathguard start
+sudo leathguard stop
+
+# Show version
+leathguard version
 ```
 
-### Post-Installation
-
-1. **Open firewall port** (if not done automatically):
-   ```bash
-   sudo ufw allow 5000/tcp
-   ```
-
-2. **Open cloud firewall** (AWS/GCP/Azure):
-   - Add inbound rule for TCP port 5000
-
-3. **Access the panel**:
-   ```
-   http://YOUR_SERVER_IP:5000
-   ```
-
-## Directory Structure
-
-After installation:
-
-```
-/etc/wireguard/
-├── wg0.conf              # WireGuard server config
-├── server.key            # Server private key
-├── server.pub            # Server public key
-└── clients/              # Client configs (created by wg-tool)
-    ├── client1.conf
-    ├── client1.key
-    └── client1.pub
-
-/opt/wg-panel/
-├── app.py                # Web panel application
-├── wg-panel.db           # SQLite database (notes, history)
-└── venv/                 # Python virtual environment
-
-/usr/local/sbin/
-└── wg-tool               # CLI management script
-```
-
-## CLI Usage
+### WireGuard Client Management (wg-tool)
 
 ```bash
 # Add a new client
-sudo wg-tool add laptop
+sudo wg-tool add clientname [endpoint]
 
-# Show QR code for mobile import
-sudo wg-tool qr laptop
+# Show QR code for client
+sudo wg-tool qr clientname
 
 # List all clients
 sudo wg-tool list
 
-# Show live connection status
+# Show live WireGuard status
 sudo wg-tool show
 
 # Revoke a client
-sudo wg-tool revoke laptop
+sudo wg-tool revoke clientname
 ```
+
+### Web Interface
+
+The web panel provides:
+
+- **Dashboard** - Overview of all clients, traffic, and server health
+- **Client Management** - Add, edit, suspend, and delete clients
+- **QR Codes** - Generate QR codes for mobile clients
+- **Traffic Stats** - Per-client bandwidth usage
+- **Settings** - Change credentials, select interface, enable auto-updates
 
 ## Configuration
 
-### WireGuard Setup
-
-The tools expect a standard WireGuard setup:
-
-```
-/etc/wireguard/
-├── wg0.conf           # Server config
-├── server.key         # Server private key
-├── server.pub         # Server public key
-└── clients/           # Client configs and keys
-    ├── client1.conf
-    ├── client1.key
-    └── client1.pub
-```
-
 ### Environment Variables
 
-The web panel can be configured via environment variables in the systemd service:
+Set these in `/etc/systemd/system/wg-panel.service`:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `WG_PANEL_USER` | Login username | `admin` |
-| `WG_PANEL_PASS_HASH` | SHA256 hash of password | — |
-| `WG_PANEL_SECRET` | Flask session secret | (random) |
-| `WG_PANEL_DB` | SQLite database path | `/opt/wg-panel/wg-panel.db` |
-| `WG_PANEL_DNS_CHECK` | Enable DNS health check | `false` |
-| `WG_PANEL_DNS_SERVER` | DNS server to check | `10.6.0.1` |
+| `WG_PANEL_USER` | Login username | admin |
+| `WG_PANEL_PASS` | Plain text password | (none) |
+| `WG_PANEL_PASS_HASH` | SHA256 password hash | (none) |
+| `WG_PANEL_DB` | Database file path | /opt/wg-panel/wg-panel.db |
+| `WG_INTERFACE` | WireGuard interface to manage | auto-detected |
 
-### Changing the Password
+### Multi-Interface Setup
 
-```bash
-# Generate new hash
-echo -n "yournewpassword" | sha256sum | cut -d' ' -f1
+If you have multiple WireGuard interfaces (e.g., wg0, wg1), set `WG_INTERFACE` in the service file:
 
-# Edit the service file
-sudo systemctl edit wg-panel
-
-# Add:
-[Service]
-Environment="WG_PANEL_PASS_HASH=your_new_hash_here"
-
-# Restart
-sudo systemctl restart wg-panel
+```ini
+Environment="WG_INTERFACE=wg1"
 ```
 
-### Changing the Port
+Or select the interface in the web panel's Settings page.
+
+### Changing Credentials
+
+**Option 1: Environment Variables (recommended for production)**
 
 ```bash
-sudo systemctl edit wg-panel
+# Generate password hash
+echo -n "yourpassword" | sha256sum | cut -d' ' -f1
 
-# Add:
-[Service]
-ExecStart=
-ExecStart=/opt/wg-panel/venv/bin/python /opt/wg-panel/app.py 8080
+# Edit service file
+sudo systemctl edit wg-panel --full
+# Add/modify:
+# Environment="WG_PANEL_USER=yourusername"
+# Environment="WG_PANEL_PASS_HASH=yourhash"
 
 sudo systemctl restart wg-panel
 ```
 
-## Security Considerations
+**Option 2: Web Interface**
 
-- **Run behind a VPN or firewall** — The panel has basic auth but is not hardened for public internet exposure
-- **Use HTTPS** — Consider putting it behind a reverse proxy (nginx/Caddy) with TLS
-- **Restrict access** — Limit the port in your firewall to trusted IPs only
-- **Private repository** — Keep your deployment private if it contains sensitive configs
+Go to Settings -> Account Settings to change username/password (only if not set via environment variables).
 
-## File Locations
+### Reverse Proxy (Nginx)
 
-| Path | Description |
-|------|-------------|
-| `/usr/local/sbin/wg-tool` | CLI management script |
-| `/opt/wg-panel/app.py` | Web panel application |
-| `/opt/wg-panel/wg-panel.db` | SQLite database (notes, history) |
-| `/etc/wireguard/wg0.conf` | WireGuard server config |
-| `/etc/wireguard/clients/` | Client configuration files |
+```nginx
+server {
+    listen 443 ssl;
+    server_name vpn.example.com;
+
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Cloudflare Tunnel
+
+LeathGuard works great with Cloudflare Tunnels for secure external access without opening ports.
+
+## Updates
+
+### Manual Update
+
+```bash
+sudo leathguard update
+```
+
+### Automatic Updates
+
+Enable in Settings -> Updates -> Automatic Updates, or manually:
+
+```bash
+# Create cron job for daily 3 AM updates
+echo '0 3 * * * root /opt/wg-panel/update.sh >> /var/log/leathguard-update.log 2>&1' | sudo tee /etc/cron.d/leathguard-autoupdate
+```
+
+### Update Notifications
+
+The dashboard shows a banner when updates are available. Click "Update Now" to apply.
+
+## Migration
+
+If you have an existing installation at a non-standard path:
+
+```bash
+cd /path/to/current/installation
+sudo ./migrate.sh
+```
+
+This will:
+1. Move files to `/opt/wg-panel`
+2. Recreate the Python virtual environment
+3. Update systemd service
+4. Standardize service name to `wg-panel`
+5. Preserve your database and settings
 
 ## Troubleshooting
 
-### Panel won't start
+### Service won't start
 
 ```bash
-# Check service status
-sudo systemctl status wg-panel
+# Check logs
+sudo journalctl -u wg-panel -n 50 --no-pager
 
-# View logs
-sudo journalctl -u wg-panel -f
+# Common issues:
+# - Missing venv: sudo python3 -m venv /opt/wg-panel/venv && sudo /opt/wg-panel/venv/bin/pip install flask
+# - Wrong permissions: sudo chown -R root:root /opt/wg-panel
+# - Port in use: Check if another service is using port 5000
 ```
 
-### "Permission denied" errors
-
-The panel needs root access to read WireGuard configs and run `wg` commands. Ensure the systemd service runs as root.
-
-### Clients not showing
-
-Verify WireGuard is running:
+### Can't login
 
 ```bash
+# Reset password via environment variable
+sudo systemctl edit wg-panel --full
+# Add: Environment="WG_PANEL_PASS=newpassword"
+sudo systemctl restart wg-panel
+```
+
+### WireGuard interface not detected
+
+```bash
+# Check WireGuard is running
 sudo wg show
+
+# Specify interface explicitly
+sudo systemctl edit wg-panel --full
+# Add: Environment="WG_INTERFACE=wg0"
+sudo systemctl restart wg-panel
 ```
 
-### Firewall issues
+### Database issues
 
 ```bash
-# Check if port is open
-sudo ufw status
+# Database location
+ls -la /opt/wg-panel/wg-panel.db
 
-# Open port if needed
-sudo ufw allow 5000/tcp
+# Reset database (WARNING: loses all settings)
+sudo rm /opt/wg-panel/wg-panel.db
+sudo systemctl restart wg-panel
 ```
 
-## Uninstall
+## File Structure
 
-```bash
-sudo systemctl stop wg-panel
-sudo systemctl disable wg-panel
-sudo rm /etc/systemd/system/wg-panel.service
-sudo rm -rf /opt/wg-panel
-sudo rm /usr/local/sbin/wg-tool
-sudo systemctl daemon-reload
+```
+/opt/wg-panel/
+├── wg-panel/
+│   └── app.py          # Main Flask application
+├── wg-tool             # WireGuard CLI tool
+├── leathguard          # Global CLI tool
+├── install.sh          # Installation script
+├── update.sh           # Update script
+├── migrate.sh          # Migration script
+├── status.sh           # Status check script
+├── VERSION             # Current version
+├── venv/               # Python virtual environment
+└── wg-panel.db         # SQLite database (created at runtime)
+
+/usr/local/sbin/wg-tool     # Symlink to wg-tool
+/usr/local/bin/leathguard   # Symlink to leathguard CLI
+/etc/systemd/system/wg-panel.service  # Systemd service
 ```
 
-## License
+## API Endpoints
 
-MIT License. See [LICENSE](LICENSE) for details.
+LeathGuard provides a REST API (requires authentication):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | Server and WireGuard status |
+| `/api/clients` | GET | List all clients |
+| `/api/health` | GET | Health check with version |
+| `/api/updates/check` | GET | Check for updates |
+| `/api/updates/apply` | POST | Apply available update |
+| `/api/settings/interface` | GET/POST | Get/set WireGuard interface |
+| `/api/settings/auto-update` | GET/POST | Get/set auto-update setting |
+
+## Security Considerations
+
+- **Always use HTTPS** in production (via reverse proxy or Cloudflare Tunnel)
+- **Change default credentials** immediately after installation
+- **Use environment variables** for credentials in production
+- **Restrict network access** to the panel (firewall, VPN-only, etc.)
+- **Keep updated** - enable auto-updates or check regularly
 
 ## Contributing
 
-Pull requests welcome. For major changes, please open an issue first.
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+## License
+
+MIT License - see LICENSE file for details.
 
 ## Acknowledgments
 
-- Inspired by [PiVPN](https://pivpn.io/)
-- Built with [Flask](https://flask.palletsprojects.com/)
-- Maps powered by [Leaflet](https://leafletjs.com/) with [CartoDB](https://carto.com/) tiles
-- GeoIP data from [ip-api.com](https://ip-api.com/)
+- WireGuard is a registered trademark of Jason A. Donenfeld
+- Built with Flask, SQLite, and vanilla JavaScript
+- Dark theme inspired by modern dashboard designs
