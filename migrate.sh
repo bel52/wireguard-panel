@@ -57,10 +57,11 @@ echo ""
 echo -e "${YELLOW}This will:${NC}"
 echo "  1. Stop $SERVICE_NAME"
 echo "  2. Move $CURRENT_PATH -> $CANONICAL_PATH"
-echo "  3. Update systemd service to use new path"
-echo "  4. Rename service to 'wg-panel' if different"
-echo "  5. Update leathguard CLI and wgdeploy alias"
-echo "  6. Restart service"
+echo "  3. Recreate Python virtual environment"
+echo "  4. Update systemd service to use new path"
+echo "  5. Rename service to 'wg-panel' if different"
+echo "  6. Update leathguard CLI and wgdeploy alias"
+echo "  7. Restart service"
 echo ""
 read -p "Continue? (y/N) " -n 1 -r
 echo ""
@@ -90,20 +91,32 @@ if [[ -f "$CANONICAL_PATH/venv/wg-panel.db" ]]; then
     cp "$CANONICAL_PATH/venv/wg-panel.db" "$CANONICAL_PATH/wg-panel.db" 2>/dev/null || true
 fi
 
+# Recreate Python virtual environment (old venv has hardcoded paths)
+echo "[3/7] Recreating Python virtual environment..."
+cd "$CANONICAL_PATH"
+rm -rf venv
+python3 -m venv venv
+./venv/bin/pip install --quiet flask
+echo "  Virtual environment recreated"
+
 # Update systemd service
-echo "[3/6] Updating systemd service..."
+echo "[4/7] Updating systemd service..."
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if [[ -f "$SERVICE_FILE" ]]; then
     # Update paths in service file
     sed -i "s|$CURRENT_PATH|$CANONICAL_PATH|g" "$SERVICE_FILE"
 
-    # Update WG_PANEL_DB path if present
-    sed -i "s|WG_PANEL_DB=.*|WG_PANEL_DB=$CANONICAL_PATH/wg-panel.db|g" "$SERVICE_FILE"
+    # Fix WG_PANEL_DB path with proper quoting
+    sed -i '/WG_PANEL_DB/d' "$SERVICE_FILE"
+    sed -i '/\[Service\]/a Environment="WG_PANEL_DB=/opt/wg-panel/wg-panel.db"' "$SERVICE_FILE"
+
+    # Ensure correct app.py path in ExecStart
+    sed -i 's|ExecStart=.*/app\.py|ExecStart=/opt/wg-panel/venv/bin/python /opt/wg-panel/wg-panel/app.py|' "$SERVICE_FILE"
 fi
 
 # Rename service if needed
-echo "[4/6] Standardizing service name..."
+echo "[5/7] Standardizing service name..."
 if [[ "$SERVICE_NAME" != "wg-panel" ]]; then
     NEW_SERVICE_FILE="/etc/systemd/system/wg-panel.service"
     mv "$SERVICE_FILE" "$NEW_SERVICE_FILE"
@@ -115,7 +128,7 @@ systemctl daemon-reload
 systemctl enable wg-panel
 
 # Update CLI and aliases
-echo "[5/6] Updating CLI and aliases..."
+echo "[6/7] Updating CLI and aliases..."
 
 # Install/update leathguard CLI
 if [[ -f "$CANONICAL_PATH/leathguard" ]]; then
@@ -136,7 +149,7 @@ for bashrc in /root/.bashrc /home/*/.bashrc; do
 done
 
 # Start service
-echo "[6/6] Starting service..."
+echo "[7/7] Starting service..."
 systemctl start wg-panel
 
 # Verify
