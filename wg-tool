@@ -274,8 +274,8 @@ cmd_qr() {
 cmd_show() {
   need_root show "$@"
   ensure_prereqs
-  echo "== wg show =="
-  wg show
+  echo "== wg show ${WG_IFACE} =="
+  wg show "$WG_IFACE"
   echo
   echo "== listening sockets (${SERVER_PORT}) =="
   ss -lunp | grep -E ":(${SERVER_PORT})\\b" || true

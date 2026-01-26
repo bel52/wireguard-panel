@@ -94,11 +94,13 @@ DNS_CHECK_SERVER = os.environ.get('WG_PANEL_DNS_SERVER', '10.6.0.1')
 
 # WireGuard config - auto-detected on startup
 WG_INTERFACE = ''
+WG_INTERFACE_SOURCE = ''  # Track how interface was selected: 'env', 'auto-single', 'auto-multiple'
 WG_CONF_PATH = ''
 WG_CLIENTS_DIR = ''
 VPN_PREFIX = ''
 VPN_SUBNET = ''
 SERVER_PUBKEY = ''
+CREDENTIAL_SOURCE = ''  # Track credential source: 'env' or 'database'
 GEOIP_CACHE = {}
 BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
 CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
@@ -257,32 +259,55 @@ def init_secret_key():
 def init_credentials():
     """Initialize credentials with persistence.
 
-    Priority:
-    1. Database stored credentials (if set)
-    2. Environment variables (WG_PANEL_USER, WG_PANEL_PASS_HASH, WG_PANEL_PASS)
+    Priority (highest to lowest):
+    1. Environment variables (explicit deployment configuration)
+    2. Database values (for web UI credential changes)
+    3. Defaults (only if nothing else set)
 
-    This allows credentials to be changed through the UI and persist across restarts.
+    This ensures systemd Environment variables ALWAYS take precedence,
+    allowing predictable deployments while still supporting UI changes
+    when env vars are not set.
     """
-    global AUTH_USER, AUTH_PASS_HASH, AUTH_PASS_PLAIN
+    global AUTH_USER, AUTH_PASS_HASH, AUTH_PASS_PLAIN, CREDENTIAL_SOURCE
+
+    # Check what's set via environment
+    env_user = os.environ.get('WG_PANEL_USER', '')
+    env_pass_hash = os.environ.get('WG_PANEL_PASS_HASH', '')
+    env_pass_plain = os.environ.get('WG_PANEL_PASS', '')
 
     conn = get_db()
     try:
-        # Try to load username from database
-        row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = 'auth_username'"
-        ).fetchone()
-        if row:
-            AUTH_USER = row['value']
-            logger.info("Loaded username from database")
+        # Only load username from DB if NOT set via env var
+        if not env_user:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = 'auth_username'"
+            ).fetchone()
+            if row:
+                AUTH_USER = row['value']
+                logger.info("Loaded username from database")
+            else:
+                logger.info("Using default username: admin")
+        else:
+            logger.info("Using username from environment variable")
 
-        # Try to load password hash from database
-        row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = 'auth_password_hash'"
-        ).fetchone()
-        if row:
-            AUTH_PASS_HASH = row['value']
-            AUTH_PASS_PLAIN = ''  # Clear plain password if hash is set
-            logger.info("Loaded password hash from database")
+        # Only load password from DB if NOT set via env var
+        if not env_pass_hash and not env_pass_plain:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = 'auth_password_hash'"
+            ).fetchone()
+            if row:
+                AUTH_PASS_HASH = row['value']
+                AUTH_PASS_PLAIN = ''  # Clear plain password if hash is set
+                CREDENTIAL_SOURCE = 'database'
+                logger.info("Loaded password hash from database")
+            else:
+                CREDENTIAL_SOURCE = 'default'
+                logger.info("No password configured - using environment default or none")
+        else:
+            CREDENTIAL_SOURCE = 'env'
+            logger.info("Using password from environment variable")
+    except Exception as e:
+        logger.debug(f"Could not load credentials from database: {e}")
     finally:
         conn.close()
 
@@ -429,13 +454,14 @@ def init_wireguard_config():
 
     Exits with helpful message if configuration cannot be determined.
     """
-    global WG_INTERFACE, WG_CONF_PATH, WG_CLIENTS_DIR, VPN_PREFIX, VPN_SUBNET, SERVER_PUBKEY
+    global WG_INTERFACE, WG_INTERFACE_SOURCE, WG_CONF_PATH, WG_CLIENTS_DIR, VPN_PREFIX, VPN_SUBNET, SERVER_PUBKEY
 
     # Check for WG_INTERFACE environment variable first
     env_interface = os.environ.get('WG_INTERFACE', '').strip()
 
     if env_interface:
         WG_INTERFACE = env_interface
+        WG_INTERFACE_SOURCE = 'env'
         logger.info(f"Using WireGuard interface from environment: {WG_INTERFACE}")
     else:
         # Auto-detect interfaces
@@ -445,31 +471,20 @@ def init_wireguard_config():
             logger.error("No WireGuard interfaces found!")
             logger.error("Please ensure WireGuard is installed and configured.")
             logger.error("Expected: /etc/wireguard/<interface>.conf")
-            print("\n" + "="*60)
-            print("ERROR: No WireGuard interfaces found!")
-            print("="*60)
-            print("\nPlease ensure WireGuard is installed and configured.")
-            print("Expected: /etc/wireguard/<interface>.conf")
-            print("="*60 + "\n")
-            import sys
-            sys.exit(1)
+            logger.error("Falling back to 'wg0' - panel may show errors until WireGuard is configured.")
+            # Don't exit - let app start but show error in UI
+            WG_INTERFACE = 'wg0'  # Fallback
+            WG_INTERFACE_SOURCE = 'fallback'
         elif len(interfaces) == 1:
             WG_INTERFACE = interfaces[0]
+            WG_INTERFACE_SOURCE = 'auto-single'
             logger.info(f"Auto-detected WireGuard interface: {WG_INTERFACE}")
         else:
-            logger.error(f"Multiple WireGuard interfaces found: {', '.join(interfaces)}")
-            logger.error("Please set WG_INTERFACE environment variable to specify which one to use.")
-            print("\n" + "="*60)
-            print("ERROR: Multiple WireGuard interfaces found!")
-            print("="*60)
-            print(f"\nAvailable interfaces: {', '.join(interfaces)}")
-            print("\nSet WG_INTERFACE environment variable to specify which one to use.")
-            print("Example: WG_INTERFACE=wg0")
-            print("\nFor systemd service, add to /etc/systemd/system/wg-panel.service:")
-            print("  Environment=\"WG_INTERFACE=wg0\"")
-            print("="*60 + "\n")
-            import sys
-            sys.exit(1)
+            # Multiple interfaces - default to wg0 with warning
+            WG_INTERFACE = 'wg0' if 'wg0' in interfaces else interfaces[0]
+            WG_INTERFACE_SOURCE = 'auto-multiple'
+            logger.warning(f"Multiple WireGuard interfaces detected: {', '.join(interfaces)}. "
+                          f"Defaulting to '{WG_INTERFACE}'. Set WG_INTERFACE environment variable to specify.")
 
     # Set derived paths
     WG_CONF_PATH = f'/etc/wireguard/{WG_INTERFACE}.conf'
@@ -1120,7 +1135,7 @@ def parse_handshake_to_seconds(hs_string):
     return total if total > 0 or sec_match else None
 
 def parse_wg_show():
-    output, _ = run_cmd(['wg', 'show'])
+    output, _ = run_cmd(['wg', 'show', WG_INTERFACE])
     peers = []
     current_peer = None
     
@@ -4028,6 +4043,30 @@ if __name__ == '__main__':
         print(f"Restored iptables rules for {restored} paused client(s)")
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"LeathGuard starting - Interface: {WG_INTERFACE}, Subnet: {VPN_SUBNET}, Clients dir: {WG_CLIENTS_DIR}")
+
+    # Format interface source for display
+    interface_source_display = {
+        'env': 'from environment variable',
+        'auto-single': 'auto-detected',
+        'auto-multiple': 'auto-detected, multiple available',
+        'fallback': 'fallback, no interfaces found'
+    }.get(WG_INTERFACE_SOURCE, 'unknown')
+
+    # Format credential source for display
+    credential_source_display = {
+        'env': 'Using password from environment variable',
+        'database': 'Using password from database',
+        'default': 'No password configured'
+    }.get(CREDENTIAL_SOURCE, 'unknown')
+
+    # Comprehensive startup log
+    print(f"\nLeathGuard WireGuard configuration:")
+    print(f"  Interface: {WG_INTERFACE} ({interface_source_display})")
+    print(f"  Config: {WG_CONF_PATH}")
+    print(f"  Clients dir: {WG_CLIENTS_DIR}")
+    print(f"  Subnet: {VPN_SUBNET}")
+    print(f"  Server pubkey: {SERVER_PUBKEY[:20]}..." if SERVER_PUBKEY else "  Server pubkey: (not available)")
+    print(f"  Credentials: {credential_source_display}")
+    print(f"LeathGuard starting - Interface: {WG_INTERFACE}, Subnet: {VPN_SUBNET}")
     print(f"LeathGuard v4 running on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
