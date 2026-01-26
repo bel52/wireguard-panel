@@ -22,6 +22,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/wg-panel"
 PORT="${WG_PANEL_PORT:-5000}"
 
+# Ensure scripts have execute permission (git may not preserve execute bit)
+chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/leathguard 2>/dev/null || true
+
 # Prompt for credentials
 echo "📝 Web Panel Authentication Setup"
 echo "─────────────────────────────────"

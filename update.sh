@@ -125,6 +125,9 @@ if [[ "$BEFORE" != "$AFTER" ]]; then
     done
 fi
 
+# Ensure scripts have execute permission
+chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/leathguard 2>/dev/null || true
+
 # Step 5: Update system files (wg-tool, leathguard CLI, app.py)
 echo "[5/6] Updating system files..."
 
@@ -151,8 +154,10 @@ if [[ -d "$INSTALL_DIR" ]]; then
     if [[ -f "$SCRIPT_DIR/wg-panel/app.py" ]]; then
         SRC="$SCRIPT_DIR/wg-panel/app.py"
         DST="$INSTALL_DIR/app.py"
-        if [[ ! "$SRC" -ef "$DST" ]] 2>/dev/null; then
-            cp "$SRC" "$DST"
+        if [[ -f "$DST" ]] && [[ "$SRC" -ef "$DST" ]] 2>/dev/null; then
+            : # Same file, skip
+        else
+            cp "$SRC" "$DST" 2>/dev/null || true
             echo "  Synced app.py to $INSTALL_DIR/"
         fi
     fi
@@ -160,8 +165,10 @@ if [[ -d "$INSTALL_DIR" ]]; then
     if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
         SRC="$SCRIPT_DIR/VERSION"
         DST="$INSTALL_DIR/VERSION"
-        if [[ ! "$SRC" -ef "$DST" ]] 2>/dev/null; then
-            cp "$SRC" "$DST"
+        if [[ -f "$DST" ]] && [[ "$SRC" -ef "$DST" ]] 2>/dev/null; then
+            : # Same file, skip
+        else
+            cp "$SRC" "$DST" 2>/dev/null || true
             echo "  Synced VERSION to $INSTALL_DIR/"
         fi
     fi

@@ -277,8 +277,8 @@ sudo systemctl restart wg-panel
 ├── venv/               # Python virtual environment
 └── wg-panel.db         # SQLite database (created at runtime)
 
-/usr/local/sbin/wg-tool     # Symlink to wg-tool
-/usr/local/bin/leathguard   # Symlink to leathguard CLI
+/usr/local/sbin/wg-tool     # Copy of wg-tool
+/usr/local/bin/leathguard   # Copy of leathguard CLI
 /etc/systemd/system/wg-panel.service  # Systemd service
 ```
 

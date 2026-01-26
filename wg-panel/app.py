@@ -663,7 +663,7 @@ def login_required(f):
 
 def run_cmd(cmd, sudo=True):
     if sudo:
-        cmd = ['sudo'] + cmd
+        cmd = ['sudo', '-E'] + cmd  # -E preserves environment variables (e.g., WG_INTERFACE)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return result.stdout + result.stderr, result.returncode
@@ -2785,7 +2785,10 @@ TEMPLATE = '''
                                 <span id="interfaceSourceBadge" style="padding:4px 10px;border-radius:12px;font-size:0.75em;white-space:nowrap;background:var(--bg-tertiary);color:var(--text-secondary);"></span>
                             </div>
                             <div id="interfaceLockedNote" style="display:none;padding:10px;background:rgba(231,76,60,0.1);border-radius:6px;font-size:0.85em;color:var(--text-secondary);margin-bottom:12px;">
-                                <strong style="color:var(--danger);">Locked:</strong> Interface is set by <code>WG_INTERFACE</code> environment variable. Remove it from the service file to enable selection here.
+                                <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                                    <span><strong style="color:var(--danger);">Locked:</strong> Interface is set by <code>WG_INTERFACE</code> environment variable.</span>
+                                    <button type="button" id="unlockInterfaceBtn" onclick="unlockInterface()" style="padding:4px 12px;background:var(--danger);color:white;border:none;border-radius:4px;cursor:pointer;font-size:0.85em;white-space:nowrap;">Unlock</button>
+                                </div>
                             </div>
                             <div id="interfaceSavedNote" style="display:none;padding:10px;background:rgba(0,212,170,0.1);border-radius:6px;font-size:0.85em;color:var(--text-secondary);margin-bottom:12px;">
                                 Different interface saved in settings. Current: <strong id="savedInterfaceName"></strong>
@@ -3613,6 +3616,42 @@ TEMPLATE = '''
                 const msgEl = document.getElementById('interfaceMessage');
                 if (msgEl) {
                     msgEl.style.display = 'none';
+                }
+            }
+
+            async function unlockInterface() {
+                if (!confirm('This will remove the WG_INTERFACE setting from the service file. You can then select an interface from the dropdown. Continue?')) {
+                    return;
+                }
+
+                const btn = document.getElementById('unlockInterfaceBtn');
+                btn.disabled = true;
+                btn.textContent = 'Unlocking...';
+
+                try {
+                    const response = await apiFetch('/api/settings/unlock-interface', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-Token': CSRF_TOKEN
+                        }
+                    });
+                    const data = await safeParseJSON(response);
+
+                    if (data.success) {
+                        showInterfaceMessage(data.message || 'Interface unlocked! Select your interface and save.', false);
+                        // Reload the interface settings to show unlocked state
+                        loadInterfaces();
+                    } else {
+                        showInterfaceMessage(data.error || 'Failed to unlock interface', true);
+                        btn.disabled = false;
+                        btn.textContent = 'Unlock';
+                    }
+                } catch (err) {
+                    if (err.message === 'Session expired') return;
+                    showInterfaceMessage('Failed to unlock: ' + err.message, true);
+                    btn.disabled = false;
+                    btn.textContent = 'Unlock';
                 }
             }
 
@@ -4535,6 +4574,56 @@ def api_set_interface():
     except Exception as e:
         logger.error(f"Failed to save interface preference: {e}")
         return jsonify({'error': 'Failed to save interface preference'}), 500
+
+@app.route('/api/settings/unlock-interface', methods=['POST'])
+@login_required
+@csrf_required
+def api_unlock_interface():
+    """Remove WG_INTERFACE from service file to allow UI selection."""
+    service_file = '/etc/systemd/system/wg-panel.service'
+
+    # Check if env var is actually set
+    env_interface = os.environ.get('WG_INTERFACE', '').strip()
+    if not env_interface:
+        return jsonify({'error': 'Interface is not locked by environment variable'}), 400
+
+    try:
+        # Check if service file exists
+        if not os.path.exists(service_file):
+            return jsonify({'error': f'Service file not found: {service_file}'}), 404
+
+        # Read current service file
+        with open(service_file, 'r') as f:
+            content = f.read()
+
+        # Remove WG_INTERFACE line
+        lines = content.split('\n')
+        new_lines = [l for l in lines if 'WG_INTERFACE=' not in l]
+
+        # Check if we actually removed anything
+        if len(new_lines) == len(lines):
+            return jsonify({'error': 'WG_INTERFACE not found in service file'}), 400
+
+        # Write back
+        with open(service_file, 'w') as f:
+            f.write('\n'.join(new_lines))
+
+        # Reload systemd (but don't restart - that would use new config)
+        subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=10)
+
+        logger.info("WG_INTERFACE removed from service file, interface unlocked")
+
+        return jsonify({
+            'success': True,
+            'message': 'Interface unlocked. Select your interface and save, then restart the service.'
+        })
+    except PermissionError:
+        return jsonify({'error': 'Permission denied. Service must run as root.'}), 403
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Timeout running systemctl daemon-reload'}), 500
+    except Exception as e:
+        logger.error(f"Failed to unlock interface: {e}")
+        return jsonify({'error': f'Failed to unlock: {str(e)}'}), 500
 
 # --------------- Update Checking ---------------
 
