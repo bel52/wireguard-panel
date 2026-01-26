@@ -125,7 +125,7 @@ if [[ "$BEFORE" != "$AFTER" ]]; then
     done
 fi
 
-# Step 5: Update wg-tool and app.py in system paths
+# Step 5: Update system files (wg-tool, leathguard CLI, app.py)
 echo "[5/6] Updating system files..."
 
 # Update wg-tool
@@ -135,6 +135,13 @@ if [[ -f "$SCRIPT_DIR/wg-tool" ]]; then
     echo "  Copied wg-tool to /usr/local/sbin/"
 else
     echo -e "  ${YELLOW}Warning: wg-tool not found in repo${NC}"
+fi
+
+# Update leathguard CLI
+if [[ -f "$SCRIPT_DIR/leathguard" ]]; then
+    cp "$SCRIPT_DIR/leathguard" /usr/local/bin/leathguard
+    chmod +x /usr/local/bin/leathguard
+    echo "  Copied leathguard to /usr/local/bin/"
 fi
 
 # Update app.py if install directory exists

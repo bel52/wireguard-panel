@@ -1,0 +1,141 @@
+#!/bin/bash
+# LeathGuard CLI
+# Global management command for LeathGuard WireGuard Panel
+#
+# Usage: leathguard <command> [options]
+
+set -e
+
+VERSION="5.0.0"
+INSTALL_DIR="/opt/wg-panel"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Check installation
+check_install() {
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        echo -e "${RED}LeathGuard not installed at $INSTALL_DIR${NC}"
+        echo "Install with: git clone https://github.com/bel52/wireguard-panel.git $INSTALL_DIR && cd $INSTALL_DIR && sudo ./install.sh"
+        exit 1
+    fi
+}
+
+# Commands
+cmd_update() {
+    check_install
+    cd "$INSTALL_DIR"
+    exec ./update.sh "$@"
+}
+
+cmd_status() {
+    check_install
+    cd "$INSTALL_DIR"
+    exec ./status.sh "$@"
+}
+
+cmd_check() {
+    check_install
+    cd "$INSTALL_DIR"
+    exec ./update.sh --check
+}
+
+cmd_restart() {
+    echo "Restarting LeathGuard..."
+    systemctl restart wg-panel
+    sleep 2
+    if systemctl is-active --quiet wg-panel; then
+        echo -e "${GREEN}LeathGuard restarted successfully${NC}"
+    else
+        echo -e "${RED}Failed to restart. Check: sudo journalctl -u wg-panel -n 50${NC}"
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    echo "Stopping LeathGuard..."
+    systemctl stop wg-panel
+    echo "Stopped."
+}
+
+cmd_start() {
+    echo "Starting LeathGuard..."
+    systemctl start wg-panel
+    sleep 2
+    if systemctl is-active --quiet wg-panel; then
+        echo -e "${GREEN}LeathGuard started${NC}"
+    else
+        echo -e "${RED}Failed to start. Check: sudo journalctl -u wg-panel -n 50${NC}"
+        exit 1
+    fi
+}
+
+cmd_logs() {
+    local lines="${1:-50}"
+    journalctl -u wg-panel -n "$lines" --no-pager
+}
+
+cmd_logs_follow() {
+    journalctl -u wg-panel -f
+}
+
+cmd_version() {
+    if [[ -f "$INSTALL_DIR/VERSION" ]]; then
+        cat "$INSTALL_DIR/VERSION"
+    else
+        echo "unknown"
+    fi
+}
+
+cmd_help() {
+    echo -e "${CYAN}LeathGuard CLI v${VERSION}${NC}"
+    echo ""
+    echo "Usage: leathguard <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  update          Update to latest version"
+    echo "  check           Check for updates without applying"
+    echo "  status          Show installation status"
+    echo "  restart         Restart the service"
+    echo "  start           Start the service"
+    echo "  stop            Stop the service"
+    echo "  logs [n]        Show last n log lines (default: 50)"
+    echo "  logs -f         Follow logs in real-time"
+    echo "  version         Show installed version"
+    echo "  help            Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  sudo leathguard update      # Update to latest"
+    echo "  sudo leathguard check       # Check for updates"
+    echo "  leathguard status           # Show status"
+    echo "  sudo leathguard logs 100    # Show last 100 log lines"
+    echo "  sudo leathguard logs -f     # Follow logs"
+}
+
+# Main
+case "${1:-help}" in
+    update)     shift; cmd_update "$@" ;;
+    check)      cmd_check ;;
+    status)     cmd_status ;;
+    restart)    cmd_restart ;;
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    logs)
+        if [[ "${2:-}" == "-f" ]]; then
+            cmd_logs_follow
+        else
+            cmd_logs "${2:-50}"
+        fi
+        ;;
+    version|-v|--version)   cmd_version ;;
+    help|-h|--help)         cmd_help ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        echo "Run 'leathguard help' for usage"
+        exit 1
+        ;;
+esac
