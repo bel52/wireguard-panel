@@ -54,8 +54,24 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection for cookies
 # Note: SESSION_COOKIE_SECURE should be True in production with HTTPS
 # app.config['SESSION_COOKIE_SECURE'] = True
 
-# App version for cache busting (update when making breaking changes)
-APP_VERSION = '4.1.0'
+# App version - read from VERSION file for semantic versioning
+def get_app_version():
+    """Read version from VERSION file in repo root."""
+    version_paths = [
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'VERSION'),  # ../VERSION from wg-panel/
+        '/opt/wg-panel/VERSION',  # Production path
+        os.path.join(os.path.dirname(__file__), 'VERSION'),  # Same directory fallback
+    ]
+    for path in version_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+    return '4.2.0'  # Fallback default
+
+APP_VERSION = get_app_version()
 
 @app.after_request
 def set_cache_headers(response):
@@ -846,7 +862,8 @@ def get_health_status():
     return {
         'overall': overall,
         'checks': checks,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'version': APP_VERSION
     }
 
 
@@ -2503,7 +2520,7 @@ TEMPLATE = '''
         <!-- Login -->
         <div class="login-container">
             <div class="card">
-                <h1>LeathGuard</h1>
+                <h1>LeathGuard <span style="font-size:0.5em;font-weight:400;color:var(--text-secondary);">v{{ app_version }}</span></h1>
                 {% for msg in get_flashed_messages() %}
                 <div class="flash error">{{ msg }}</div>
                 {% endfor %}
@@ -2524,7 +2541,7 @@ TEMPLATE = '''
         <!-- Dashboard -->
         <div class="header">
             <div>
-                <h1>LeathGuard</h1>
+                <h1>LeathGuard <span style="font-size:0.5em;font-weight:400;color:var(--text-secondary);">v{{ app_version }}</span></h1>
                 <div class="header-subtitle">VPN • Clients • Traffic • Activity</div>
             </div>
             <div class="header-actions">
@@ -2769,6 +2786,14 @@ TEMPLATE = '''
                         </div>
                     </form>
                 </div>
+                <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
+                <div class="settings-section">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">About</h3>
+                    <div style="color:var(--text-secondary);font-size:0.9em;">
+                        <p><strong>LeathGuard</strong> v{{ app_version }}</p>
+                        <p style="margin-top:8px;font-size:0.85em;">WireGuard VPN Management Panel</p>
+                    </div>
+                </div>
                 <div class="form-actions" style="margin-top:20px;padding-top:15px;border-top:1px solid var(--bg-tertiary);">
                     <button type="button" class="btn btn-secondary" onclick="hideModals()">Close</button>
                 </div>
@@ -2782,7 +2807,7 @@ TEMPLATE = '''
 
             // ===== Cache/Storage Version Management =====
             // Prevents stale localStorage data from breaking the app
-            const APP_STORAGE_VERSION = '4.1.0';
+            const APP_STORAGE_VERSION = '{{ app_version }}';
             const storedVersion = localStorage.getItem('appVersion');
             if (storedVersion !== APP_STORAGE_VERSION) {
                 // Clear potentially stale settings on version change
@@ -4013,9 +4038,12 @@ TEMPLATE = '''
 # --------------- Context Processor ---------------
 
 @app.context_processor
-def inject_csrf_token():
-    """Make CSRF token available in all templates."""
-    return {'csrf_token': generate_csrf_token}
+def inject_template_globals():
+    """Make CSRF token and app version available in all templates."""
+    return {
+        'csrf_token': generate_csrf_token,
+        'app_version': APP_VERSION
+    }
 
 
 # --------------- Routes ---------------
@@ -4381,13 +4409,13 @@ if __name__ == '__main__':
     }.get(CREDENTIAL_SOURCE, 'unknown')
 
     # Comprehensive startup log
-    print(f"\nLeathGuard WireGuard configuration:")
+    print(f"\nLeathGuard v{APP_VERSION} starting...")
+    print(f"\nWireGuard configuration:")
     print(f"  Interface: {WG_INTERFACE} ({interface_source_display})")
     print(f"  Config: {WG_CONF_PATH}")
     print(f"  Clients dir: {WG_CLIENTS_DIR}")
     print(f"  Subnet: {VPN_SUBNET}")
     print(f"  Server pubkey: {SERVER_PUBKEY[:20]}..." if SERVER_PUBKEY else "  Server pubkey: (not available)")
     print(f"  Credentials: {credential_source_display}")
-    print(f"LeathGuard starting - Interface: {WG_INTERFACE}, Subnet: {VPN_SUBNET}")
-    print(f"LeathGuard v4 running on port {port}")
+    print(f"\nLeathGuard v{APP_VERSION} running on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
