@@ -447,7 +447,10 @@ def init_wireguard_config():
 
     This function:
     1. Detects available WireGuard interfaces
-    2. Selects interface (from WG_INTERFACE env or auto-detect single interface)
+    2. Selects interface with priority:
+       a. WG_INTERFACE environment variable (highest - explicit override)
+       b. Database app_settings.wg_interface (user selection from UI)
+       c. Auto-detect (single interface or default to wg0)
     3. Parses subnet prefix from config file
     4. Gets server public key
     5. Creates clients directory if needed
@@ -456,7 +459,7 @@ def init_wireguard_config():
     """
     global WG_INTERFACE, WG_INTERFACE_SOURCE, WG_CONF_PATH, WG_CLIENTS_DIR, VPN_PREFIX, VPN_SUBNET, SERVER_PUBKEY
 
-    # Check for WG_INTERFACE environment variable first
+    # Check for WG_INTERFACE environment variable first (highest priority)
     env_interface = os.environ.get('WG_INTERFACE', '').strip()
 
     if env_interface:
@@ -464,27 +467,51 @@ def init_wireguard_config():
         WG_INTERFACE_SOURCE = 'env'
         logger.info(f"Using WireGuard interface from environment: {WG_INTERFACE}")
     else:
-        # Auto-detect interfaces
+        # Check database for saved interface preference (second priority)
+        db_interface = None
+        try:
+            conn = get_db()
+            row = conn.execute("SELECT value FROM app_settings WHERE key = 'wg_interface'").fetchone()
+            if row:
+                db_interface = row['value']
+            conn.close()
+        except Exception as e:
+            logger.debug(f"Failed to read interface from database: {e}")
+
+        # Auto-detect available interfaces
         interfaces = detect_wireguard_interfaces()
 
-        if len(interfaces) == 0:
-            logger.error("No WireGuard interfaces found!")
-            logger.error("Please ensure WireGuard is installed and configured.")
-            logger.error("Expected: /etc/wireguard/<interface>.conf")
-            logger.error("Falling back to 'wg0' - panel may show errors until WireGuard is configured.")
-            # Don't exit - let app start but show error in UI
-            WG_INTERFACE = 'wg0'  # Fallback
-            WG_INTERFACE_SOURCE = 'fallback'
-        elif len(interfaces) == 1:
-            WG_INTERFACE = interfaces[0]
-            WG_INTERFACE_SOURCE = 'auto-single'
-            logger.info(f"Auto-detected WireGuard interface: {WG_INTERFACE}")
-        else:
-            # Multiple interfaces - default to wg0 with warning
-            WG_INTERFACE = 'wg0' if 'wg0' in interfaces else interfaces[0]
-            WG_INTERFACE_SOURCE = 'auto-multiple'
-            logger.warning(f"Multiple WireGuard interfaces detected: {', '.join(interfaces)}. "
-                          f"Defaulting to '{WG_INTERFACE}'. Set WG_INTERFACE environment variable to specify.")
+        if db_interface:
+            # Validate saved interface still exists
+            conf_path = f'/etc/wireguard/{db_interface}.conf'
+            if db_interface in interfaces or os.path.exists(conf_path):
+                WG_INTERFACE = db_interface
+                WG_INTERFACE_SOURCE = 'database'
+                logger.info(f"Using WireGuard interface from saved setting: {WG_INTERFACE}")
+            else:
+                logger.warning(f"Saved interface '{db_interface}' no longer exists, falling back to auto-detect")
+                db_interface = None  # Fall through to auto-detect
+
+        if not db_interface:
+            # Auto-detect (lowest priority)
+            if len(interfaces) == 0:
+                logger.error("No WireGuard interfaces found!")
+                logger.error("Please ensure WireGuard is installed and configured.")
+                logger.error("Expected: /etc/wireguard/<interface>.conf")
+                logger.error("Falling back to 'wg0' - panel may show errors until WireGuard is configured.")
+                # Don't exit - let app start but show error in UI
+                WG_INTERFACE = 'wg0'  # Fallback
+                WG_INTERFACE_SOURCE = 'fallback'
+            elif len(interfaces) == 1:
+                WG_INTERFACE = interfaces[0]
+                WG_INTERFACE_SOURCE = 'auto-single'
+                logger.info(f"Auto-detected WireGuard interface: {WG_INTERFACE}")
+            else:
+                # Multiple interfaces - default to wg0 with warning
+                WG_INTERFACE = 'wg0' if 'wg0' in interfaces else interfaces[0]
+                WG_INTERFACE_SOURCE = 'auto-multiple'
+                logger.warning(f"Multiple WireGuard interfaces detected: {', '.join(interfaces)}. "
+                              f"Defaulting to '{WG_INTERFACE}'. Set WG_INTERFACE environment variable to specify.")
 
     # Set derived paths
     WG_CONF_PATH = f'/etc/wireguard/{WG_INTERFACE}.conf'
@@ -2679,6 +2706,32 @@ TEMPLATE = '''
         <div class="modal" id="settingsModal">
             <div class="modal-content">
                 <h2>Settings</h2>
+                <div class="settings-section" id="interfaceSection">
+                    <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">WireGuard Interface</h3>
+                    <div id="interfaceLoading" style="color:var(--text-secondary);font-size:0.9em;">Loading interfaces...</div>
+                    <div id="interfaceContent" style="display:none;">
+                        <div class="form-group">
+                            <label>Current Interface</label>
+                            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                                <select id="interfaceSelect" style="flex:1;padding:8px 12px;background:var(--bg-tertiary);border:1px solid var(--bg-tertiary);border-radius:6px;color:var(--text-primary);font-size:0.95em;">
+                                    <option value="">Loading...</option>
+                                </select>
+                                <span id="interfaceSourceBadge" style="padding:4px 10px;border-radius:12px;font-size:0.75em;white-space:nowrap;background:var(--bg-tertiary);color:var(--text-secondary);"></span>
+                            </div>
+                            <div id="interfaceLockedNote" style="display:none;padding:10px;background:rgba(231,76,60,0.1);border-radius:6px;font-size:0.85em;color:var(--text-secondary);margin-bottom:12px;">
+                                <strong style="color:var(--danger);">Locked:</strong> Interface is set by <code>WG_INTERFACE</code> environment variable. Remove it from the service file to enable selection here.
+                            </div>
+                            <div id="interfaceSavedNote" style="display:none;padding:10px;background:rgba(0,212,170,0.1);border-radius:6px;font-size:0.85em;color:var(--text-secondary);margin-bottom:12px;">
+                                Different interface saved in settings. Current: <strong id="savedInterfaceName"></strong>
+                            </div>
+                        </div>
+                        <div class="form-actions" style="margin-bottom:0;">
+                            <button type="button" id="interfaceSaveBtn" class="btn" onclick="saveInterface()">Save Interface</button>
+                        </div>
+                        <div id="interfaceMessage" style="display:none;margin-top:12px;padding:10px;border-radius:8px;font-size:0.9em;"></div>
+                    </div>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--bg-tertiary);margin:20px 0;">
                 <div class="settings-section">
                     <h3 style="font-size:1em;color:var(--text-primary);margin-bottom:12px;">Change Username</h3>
                     <form id="usernameForm">
@@ -3312,7 +3365,157 @@ TEMPLATE = '''
                 document.getElementById('newPassword').value = '';
                 document.getElementById('confirmPassword').value = '';
                 hideSettingsMessage();
+                hideInterfaceMessage();
                 document.getElementById('settingsModal').classList.add('active');
+                // Load interface settings
+                loadInterfaces();
+            }
+
+            // Interface settings
+            let interfaceData = null;
+
+            function loadInterfaces() {
+                const loading = document.getElementById('interfaceLoading');
+                const content = document.getElementById('interfaceContent');
+                loading.style.display = 'block';
+                content.style.display = 'none';
+
+                apiFetch('/api/settings/interfaces')
+                    .then(safeParseJSON)
+                    .then(data => {
+                        interfaceData = data;
+                        const select = document.getElementById('interfaceSelect');
+                        const badge = document.getElementById('interfaceSourceBadge');
+                        const lockedNote = document.getElementById('interfaceLockedNote');
+                        const savedNote = document.getElementById('interfaceSavedNote');
+                        const saveBtn = document.getElementById('interfaceSaveBtn');
+
+                        // Populate dropdown
+                        select.innerHTML = '';
+                        if (data.available && data.available.length > 0) {
+                            data.available.forEach(iface => {
+                                const opt = document.createElement('option');
+                                opt.value = iface;
+                                opt.textContent = iface;
+                                if (iface === data.current) opt.selected = true;
+                                select.appendChild(opt);
+                            });
+                        } else {
+                            const opt = document.createElement('option');
+                            opt.value = data.current || 'wg0';
+                            opt.textContent = data.current || 'wg0';
+                            opt.selected = true;
+                            select.appendChild(opt);
+                        }
+
+                        // Set source badge
+                        badge.textContent = data.source || 'unknown';
+                        if (data.source && data.source.includes('environment')) {
+                            badge.style.background = 'rgba(231,76,60,0.2)';
+                            badge.style.color = 'var(--danger)';
+                        } else if (data.source && data.source.includes('database')) {
+                            badge.style.background = 'rgba(0,212,170,0.2)';
+                            badge.style.color = 'var(--success)';
+                        } else {
+                            badge.style.background = 'var(--bg-tertiary)';
+                            badge.style.color = 'var(--text-secondary)';
+                        }
+
+                        // Handle locked state
+                        if (data.locked) {
+                            select.disabled = true;
+                            saveBtn.disabled = true;
+                            saveBtn.style.opacity = '0.5';
+                            lockedNote.style.display = 'block';
+                        } else {
+                            select.disabled = false;
+                            saveBtn.disabled = false;
+                            saveBtn.style.opacity = '1';
+                            lockedNote.style.display = 'none';
+                        }
+
+                        // Show note if saved interface differs from current
+                        if (data.saved && data.saved !== data.current && !data.locked) {
+                            savedNote.style.display = 'block';
+                            document.getElementById('savedInterfaceName').textContent = data.saved;
+                        } else {
+                            savedNote.style.display = 'none';
+                        }
+
+                        loading.style.display = 'none';
+                        content.style.display = 'block';
+                    })
+                    .catch(err => {
+                        if (err.message === 'Session expired') return;
+                        loading.textContent = 'Failed to load interfaces: ' + err.message;
+                        loading.style.color = 'var(--danger)';
+                    });
+            }
+
+            function saveInterface() {
+                const select = document.getElementById('interfaceSelect');
+                const newInterface = select.value;
+
+                if (!newInterface) {
+                    showInterfaceMessage('Please select an interface', true);
+                    return;
+                }
+
+                if (interfaceData && newInterface === interfaceData.current && interfaceData.source && interfaceData.source.includes('database')) {
+                    showInterfaceMessage('This interface is already active', false);
+                    return;
+                }
+
+                const saveBtn = document.getElementById('interfaceSaveBtn');
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Saving...';
+
+                apiFetch('/api/settings/interface', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
+                    body: JSON.stringify({ interface: newInterface })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save Interface';
+                    if (data.ok) {
+                        let msg = data.message || 'Interface saved successfully';
+                        if (data.warning) {
+                            msg += '<br><span style="color:var(--warning);">' + data.warning + '</span>';
+                        }
+                        showInterfaceMessage(msg, false, true);
+                        // Reload interface data
+                        loadInterfaces();
+                    } else {
+                        showInterfaceMessage(data.error || 'Failed to save interface', true);
+                    }
+                })
+                .catch(err => {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save Interface';
+                    if (err.message === 'Session expired') return;
+                    showInterfaceMessage(err.message || 'Failed to save interface', true);
+                });
+            }
+
+            function showInterfaceMessage(message, isError = false, isHtml = false) {
+                const msgEl = document.getElementById('interfaceMessage');
+                if (isHtml) {
+                    msgEl.innerHTML = message;
+                } else {
+                    msgEl.textContent = message;
+                }
+                msgEl.style.display = 'block';
+                msgEl.style.background = isError ? 'rgba(231,76,60,0.15)' : 'rgba(0,212,170,0.15)';
+                msgEl.style.color = isError ? 'var(--danger)' : 'var(--success)';
+            }
+
+            function hideInterfaceMessage() {
+                const msgEl = document.getElementById('interfaceMessage');
+                if (msgEl) {
+                    msgEl.style.display = 'none';
+                }
             }
 
             function showSettingsMessage(message, isError = false) {
@@ -3965,6 +4168,124 @@ def api_change_username():
         return jsonify({'ok': True, 'message': 'Username changed successfully'})
 
     return jsonify({'error': 'Failed to update username'}), 500
+
+@app.route('/api/settings/interfaces', methods=['GET'])
+@login_required
+def api_get_interfaces():
+    """Get available WireGuard interfaces and current selection."""
+    available = detect_wireguard_interfaces()
+
+    # Determine source of current interface selection
+    env_interface = os.environ.get('WG_INTERFACE', '').strip()
+
+    # Check database for saved interface preference
+    db_interface = None
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'wg_interface'").fetchone()
+        if row:
+            db_interface = row['value']
+        conn.close()
+    except Exception as e:
+        logger.debug(f"Failed to read interface from database: {e}")
+
+    # Determine source
+    if env_interface:
+        source = 'environment'
+    elif db_interface and db_interface == WG_INTERFACE:
+        source = 'database'
+    elif WG_INTERFACE_SOURCE == 'auto-single':
+        source = 'auto-detected (single interface)'
+    elif WG_INTERFACE_SOURCE == 'auto-multiple':
+        source = 'auto-detected (multiple interfaces, defaulted)'
+    elif WG_INTERFACE_SOURCE == 'fallback':
+        source = 'fallback (no interfaces found)'
+    else:
+        source = 'auto-detected'
+
+    return jsonify({
+        'available': available,
+        'current': WG_INTERFACE,
+        'source': source,
+        'locked': bool(env_interface),
+        'saved': db_interface
+    })
+
+@app.route('/api/settings/interface', methods=['POST'])
+@login_required
+@csrf_required
+def api_set_interface():
+    """Set the WireGuard interface to use. Requires service restart to apply."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+
+    new_interface = data.get('interface', '').strip()
+
+    if not new_interface:
+        return jsonify({'error': 'Interface name is required'}), 400
+
+    # Validate interface name (basic security check)
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', new_interface):
+        return jsonify({'error': 'Invalid interface name'}), 400
+
+    # Check if env var is set (interface is locked)
+    env_interface = os.environ.get('WG_INTERFACE', '').strip()
+    if env_interface:
+        return jsonify({
+            'error': 'Interface is locked by WG_INTERFACE environment variable. Remove it from the service file to enable selection here.'
+        }), 403
+
+    # Validate interface exists
+    available = detect_wireguard_interfaces()
+    if new_interface not in available:
+        # Also check if config file exists
+        conf_path = f'/etc/wireguard/{new_interface}.conf'
+        if not os.path.exists(conf_path):
+            return jsonify({'error': f'Interface "{new_interface}" not found'}), 400
+
+    # Save to database
+    try:
+        conn = get_db()
+        conn.execute('''
+            INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+            VALUES ('wg_interface', ?, datetime('now'))
+        ''', (new_interface,))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"WireGuard interface preference saved: {new_interface}")
+
+        # Check if switching would affect active connections
+        warning = None
+        if new_interface != WG_INTERFACE:
+            try:
+                # Get current connected clients count
+                result = subprocess.run(
+                    ['wg', 'show', WG_INTERFACE, 'peers'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    peers = [p for p in result.stdout.strip().split('\n') if p]
+                    if peers:
+                        warning = f'Note: {len(peers)} peer(s) are currently configured on {WG_INTERFACE}.'
+            except Exception:
+                pass
+
+        response = {
+            'ok': True,
+            'message': f'Interface changed to {new_interface}. Restart the service to apply: sudo systemctl restart wg-panel',
+            'new_interface': new_interface
+        }
+        if warning:
+            response['warning'] = warning
+
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Failed to save interface preference: {e}")
+        return jsonify({'error': 'Failed to save interface preference'}), 500
 
 @app.route('/add', methods=['POST'])
 @login_required
