@@ -36,10 +36,25 @@ detect_interface() {
         elif [[ ${#iface_array[@]} -eq 0 ]]; then
             return 1
         else
-            echo "ERROR: Multiple WireGuard interfaces found: $interfaces" >&2
-            echo "Set WG_INTERFACE environment variable to specify which one to use." >&2
-            echo "Example: WG_INTERFACE=wg0 wg-tool list" >&2
-            exit 1
+            # Multiple interfaces - auto-select: prefer wg0 if available, otherwise first alphabetically
+            local selected
+            for iface in "${iface_array[@]}"; do
+                if [[ "$iface" == "wg0" ]]; then
+                    selected="wg0"
+                    break
+                fi
+            done
+            if [[ -z "$selected" ]]; then
+                # Sort and pick first
+                selected=$(printf '%s\n' "${iface_array[@]}" | sort | head -1)
+            fi
+            # Only warn in interactive mode (not when called from web panel)
+            if [[ -t 1 ]]; then
+                echo "NOTE: Multiple interfaces found ($interfaces), auto-selected: $selected" >&2
+                echo "Set WG_INTERFACE to change. Example: WG_INTERFACE=wg1 wg-tool list" >&2
+            fi
+            echo "$selected"
+            return 0
         fi
     fi
 
@@ -60,10 +75,24 @@ detect_interface() {
     elif [[ ${#valid_confs[@]} -eq 0 ]]; then
         return 1
     else
-        echo "ERROR: Multiple WireGuard configs found: ${valid_confs[*]}" >&2
-        echo "Set WG_INTERFACE environment variable to specify which one to use." >&2
-        echo "Example: WG_INTERFACE=wg0 wg-tool list" >&2
-        exit 1
+        # Multiple configs - auto-select: prefer wg0 if available, otherwise first alphabetically
+        local selected=""
+        for conf_name in "${valid_confs[@]}"; do
+            if [[ "$conf_name" == "wg0" ]]; then
+                selected="wg0"
+                break
+            fi
+        done
+        if [[ -z "$selected" ]]; then
+            selected=$(printf '%s\n' "${valid_confs[@]}" | sort | head -1)
+        fi
+        # Only warn in interactive mode (not when called from web panel)
+        if [[ -t 1 ]]; then
+            echo "NOTE: Multiple configs found (${valid_confs[*]}), auto-selected: $selected" >&2
+            echo "Set WG_INTERFACE to change. Example: WG_INTERFACE=wg1 wg-tool list" >&2
+        fi
+        echo "$selected"
+        return 0
     fi
 }
 
@@ -105,7 +134,17 @@ detect_server_port() {
 detect_dns() {
     local conf_file="$1"
     local prefix="$2"
-    # First try to get DNS from existing client configs
+    # First try to get DNS from the server's interface config
+    local dns_line
+    dns_line=$(grep -E "^DNS\s*=" "$conf_file" 2>/dev/null | head -1)
+    if [[ -n "$dns_line" ]]; then
+        local dns
+        dns=$(echo "$dns_line" | sed -E 's/^DNS\s*=\s*//' | tr -d ' ')
+        if [[ -n "$dns" ]]; then
+            echo "$dns"
+            return 0
+        fi
+    fi
     # Otherwise default to server IP (first in subnet)
     echo "${prefix}.1"
 }
@@ -237,13 +276,41 @@ cmd_add() {
   # Ensure NAT rule exists for this subnet
   check_nat_rule
 
-  local name="${1:-}"
-  [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip]"; exit 1; }
+  local name=""
+  local endpoint_host=""
+  local dns_override=""
 
-  local endpoint_host="${2:-}"
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dns)
+        dns_override="${2:-}"
+        shift 2
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        elif [[ -z "$endpoint_host" ]]; then
+          endpoint_host="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip] [--dns <dns_servers>]"; exit 1; }
+
   if [[ -z "$endpoint_host" ]]; then
     endpoint_host="$(pub_ip)"
     [[ -n "$endpoint_host" ]] || endpoint_host="YOUR_PUBLIC_IP_OR_DNS"
+  fi
+
+  # Determine DNS to use
+  local client_dns
+  if [[ -n "$dns_override" ]]; then
+    client_dns="$dns_override"
+  else
+    client_dns="$DNS_IP"
   fi
 
   local ip
@@ -282,7 +349,7 @@ EOP
 [Interface]
 PrivateKey = ${client_priv}
 Address = ${ip}/32
-DNS = ${DNS_IP}
+DNS = ${client_dns}
 
 [Peer]
 PublicKey = ${server_pub}
@@ -295,6 +362,7 @@ EOC
   apply_config
 
   echo "OK: created ${conf}"
+  echo "DNS: ${client_dns}"
   echo "Tip: wg-tool qr ${name}"
 }
 
@@ -492,17 +560,127 @@ cmd_revoke_orphan() {
   echo "OK: revoked orphan peer"
 }
 
+cmd_regen() {
+  # Regenerate client config with new DNS settings
+  need_root regen "$@"
+  ensure_prereqs
+
+  local name=""
+  local dns_override=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dns)
+        dns_override="${2:-}"
+        shift 2
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        elif [[ -z "$dns_override" ]]; then
+          # Allow dns as positional arg for backward compat
+          dns_override="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || { echo "Usage: wg-tool regen <client_name> [--dns <dns_servers>]"; exit 1; }
+
+  local conf="${CLIENT_DIR}/${name}.conf"
+  [[ -f "$conf" ]] || { echo "ERROR: Client config not found: $conf"; exit 1; }
+
+  # Read existing values from the config
+  local private_key address
+  private_key=$(grep -E "^PrivateKey\s*=" "$conf" | sed -E 's/^PrivateKey\s*=\s*//')
+  address=$(grep -E "^Address\s*=" "$conf" | sed -E 's/^Address\s*=\s*//')
+
+  [[ -n "$private_key" ]] || { echo "ERROR: Could not read PrivateKey from $conf"; exit 1; }
+  [[ -n "$address" ]] || { echo "ERROR: Could not read Address from $conf"; exit 1; }
+
+  # Get server info
+  local server_pub
+  if [[ -n "$SERVER_PUB_KEY" ]]; then
+    server_pub="$SERVER_PUB_KEY"
+  else
+    server_pub="$(cat "$SERVER_PUB" 2>/dev/null)" || server_pub=""
+  fi
+  [[ -n "$server_pub" ]] || { echo "ERROR: Could not determine server public key"; exit 1; }
+
+  # Get endpoint (use existing or detect)
+  local endpoint
+  endpoint=$(grep -E "^Endpoint\s*=" "$conf" 2>/dev/null | sed -E 's/^Endpoint\s*=\s*//')
+  if [[ -z "$endpoint" ]]; then
+    local pub_ip_addr
+    pub_ip_addr="$(pub_ip)"
+    [[ -n "$pub_ip_addr" ]] && endpoint="${pub_ip_addr}:${SERVER_PORT}" || endpoint="YOUR_PUBLIC_IP:${SERVER_PORT}"
+  fi
+
+  # Determine DNS to use
+  local client_dns
+  if [[ -n "$dns_override" ]]; then
+    client_dns="$dns_override"
+  else
+    client_dns="$DNS_IP"
+  fi
+
+  # Create backup
+  cp -a "$conf" "${conf}.bak_$(date +%Y%m%d_%H%M%S)"
+
+  # Regenerate config
+  cat > "$conf" <<EOC
+[Interface]
+PrivateKey = ${private_key}
+Address = ${address}
+DNS = ${client_dns}
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${endpoint}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOC
+
+  chmod 600 "$conf"
+
+  echo "OK: Regenerated config for ${name}"
+  echo "DNS: ${client_dns}"
+  echo "NOTE: Client must re-scan QR code or re-import config for changes to take effect."
+}
+
+cmd_get_dns() {
+  # Get the current DNS setting for a client
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: wg-tool get-dns <client_name>"; exit 1; }
+
+  local conf="${CLIENT_DIR}/${name}.conf"
+  [[ -f "$conf" ]] || { echo "ERROR: Client config not found: $conf"; exit 1; }
+
+  local dns
+  dns=$(grep -E "^DNS\s*=" "$conf" 2>/dev/null | sed -E 's/^DNS\s*=\s*//')
+  if [[ -n "$dns" ]]; then
+    echo "$dns"
+  else
+    echo "No DNS configured"
+    exit 1
+  fi
+}
+
 usage() {
   cat <<USAGE
 Usage: sudo wg-tool <command> [args]
 
 Commands:
-  add <name> [endpoint]     Create client + add peer (no disconnect)
-  qr <name>                 Print QR code for client config
-  list                      List clients + peers
-  revoke <name>             Remove peer + delete client files (no disconnect)
-  revoke-orphan <pubkey>    Remove orphan peer by public key (no config files)
-  show                      Show wireguard status
+  add <name> [endpoint] [--dns <servers>]  Create client + add peer
+  regen <name> [--dns <servers>]           Regenerate config with new DNS
+  get-dns <name>                           Show client's current DNS
+  qr <name>                                Print QR code for client config
+  list                                     List clients + peers
+  revoke <name>                            Remove peer + delete client files
+  revoke-orphan <pubkey>                   Remove orphan peer by public key
+  show                                     Show wireguard status
 
 Current configuration (auto-detected):
   Interface:   ${WG_IFACE}
@@ -514,10 +692,23 @@ Current configuration (auto-detected):
 Environment variables:
   WG_INTERFACE  Override auto-detected interface (e.g., WG_INTERFACE=wg1)
 
+DNS Presets (use with --dns):
+  Pi-hole (server):    ${VPN_PREFIX}.1
+  Google:              8.8.8.8, 8.8.4.4
+  Cloudflare:          1.1.1.1, 1.0.0.1
+  Cloudflare Family:   1.1.1.3, 1.0.0.3
+  Quad9:               9.9.9.9, 149.112.112.112
+
+Examples:
+  wg-tool add phone                           # Uses default DNS
+  wg-tool add laptop --dns "8.8.8.8, 8.8.4.4" # Uses Google DNS
+  wg-tool regen phone --dns "1.1.1.1"         # Change phone's DNS to Cloudflare
+
 Notes:
 - Default endpoint is detected public IP; override with a DNS name if you have one.
-- DNS for clients defaults to the first IP in the subnet (${DNS_IP}).
+- DNS for clients defaults to server IP (${DNS_IP}) unless overridden.
 - Changes are applied live via 'wg syncconf' — existing clients stay connected.
+- After 'regen', clients must re-import their config for DNS changes to apply.
 USAGE
 }
 
@@ -526,6 +717,8 @@ main() {
   shift || true
   case "$cmd" in
     add) cmd_add "$@";;
+    regen) cmd_regen "$@";;
+    get-dns) cmd_get_dns "$@";;
     qr) cmd_qr "$@";;
     list) cmd_list;;
     revoke) cmd_revoke "$@";;

@@ -78,19 +78,66 @@ python3 -m venv "$INSTALL_DIR/venv"
 touch "$INSTALL_DIR/wg-panel.db"
 chmod 600 "$INSTALL_DIR/wg-panel.db"
 
-# Detect WireGuard interface for systemd dependency
+# Detect WireGuard interfaces
+echo ""
+echo "[4.5/8] Detecting WireGuard interfaces..."
+WG_INTERFACES=""
 WG_IFACE=""
+WG_INTERFACE_ENV=""
+
+# Get interfaces from wg show
 if command -v wg &>/dev/null; then
-    WG_IFACE=$(wg show interfaces 2>/dev/null | awk '{print $1}')
+    WG_INTERFACES=$(wg show interfaces 2>/dev/null)
 fi
-if [[ -z "$WG_IFACE" ]]; then
-    # Fallback: check for .conf files
+
+# Fallback: check for .conf files
+if [[ -z "$WG_INTERFACES" ]]; then
     for conf in /etc/wireguard/*.conf; do
         [[ -f "$conf" ]] || continue
-        WG_IFACE=$(basename "$conf" .conf)
-        break
+        name=$(basename "$conf" .conf)
+        # Skip files that look like client configs
+        [[ "$name" != *_clients* ]] && WG_INTERFACES="$WG_INTERFACES $name"
+    done
+    WG_INTERFACES=$(echo "$WG_INTERFACES" | xargs)  # Trim whitespace
+fi
+
+IFACE_COUNT=$(echo "$WG_INTERFACES" | wc -w)
+
+if [[ $IFACE_COUNT -eq 0 ]]; then
+    echo "   No WireGuard interfaces found in /etc/wireguard/"
+    echo "   Install will continue, but you'll need to configure WireGuard first."
+    WG_IFACE=""
+elif [[ $IFACE_COUNT -eq 1 ]]; then
+    WG_IFACE=$(echo "$WG_INTERFACES" | tr -d ' ')
+    echo "   Found interface: $WG_IFACE"
+else
+    echo "   Found multiple interfaces: $WG_INTERFACES"
+    echo ""
+    echo "   Which interface should LeathGuard manage?"
+    echo ""
+
+    # Create selection menu
+    i=1
+    for iface in $WG_INTERFACES; do
+        echo "      $i) $iface"
+        eval "IFACE_$i=$iface"
+        ((i++))
+    done
+    echo ""
+
+    while true; do
+        read -p "   Select [1-$((i-1))]: " selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -lt "$i" ]]; then
+            eval "WG_IFACE=\$IFACE_$selection"
+            echo "   Selected: $WG_IFACE"
+            WG_INTERFACE_ENV="$WG_IFACE"
+            break
+        else
+            echo "   Invalid selection. Please enter a number 1-$((i-1))"
+        fi
     done
 fi
+
 WG_SERVICE=""
 if [[ -n "$WG_IFACE" ]]; then
     WG_SERVICE=" wg-quick@${WG_IFACE}.service"
@@ -98,8 +145,9 @@ fi
 
 # Install systemd service
 echo "[6/8] Configuring systemd service..."
-cat > /etc/systemd/system/wg-panel.service <<EOF
-[Unit]
+
+# Build the service file content
+SERVICE_CONTENT="[Unit]
 Description=LeathGuard Web Panel
 After=network.target${WG_SERVICE}
 
@@ -107,18 +155,30 @@ After=network.target${WG_SERVICE}
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-Environment="WG_PANEL_USER=$WG_USER"
-Environment="WG_PANEL_PASS_HASH=$PASS_HASH"
-Environment="WG_PANEL_DB=$INSTALL_DIR/wg-panel.db"
+Environment=\"WG_PANEL_USER=$WG_USER\"
+Environment=\"WG_PANEL_PASS_HASH=$PASS_HASH\"
+Environment=\"WG_PANEL_DB=$INSTALL_DIR/wg-panel.db\""
+
+# Add WG_INTERFACE if it was explicitly selected from multiple interfaces
+if [[ -n "$WG_INTERFACE_ENV" ]]; then
+    SERVICE_CONTENT="$SERVICE_CONTENT
+Environment=\"WG_INTERFACE=$WG_INTERFACE_ENV\""
+    echo "   Setting WG_INTERFACE=$WG_INTERFACE_ENV in service file"
+else
+    SERVICE_CONTENT="$SERVICE_CONTENT
 # WG_INTERFACE is auto-detected. Uncomment below to override for multi-interface setups:
-# Environment="WG_INTERFACE=wg1"
+# Environment=\"WG_INTERFACE=wg1\""
+fi
+
+SERVICE_CONTENT="$SERVICE_CONTENT
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/app.py $PORT
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
-EOF
+WantedBy=multi-user.target"
+
+echo "$SERVICE_CONTENT" > /etc/systemd/system/wg-panel.service
 
 systemctl daemon-reload
 systemctl enable wg-panel >/dev/null 2>&1
