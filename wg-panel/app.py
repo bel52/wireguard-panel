@@ -118,6 +118,8 @@ VPN_SUBNET = ''
 SERVER_PUBKEY = ''
 CREDENTIAL_SOURCE = ''  # Track credential source: 'env' or 'database'
 GEOIP_CACHE = {}
+GEOIP_PENDING = set()  # IPs currently being looked up in background
+GEOIP_LOCK = threading.Lock()  # Thread safety for GeoIP operations
 BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
 CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
 DISCONNECT_GRACE_SECONDS = 120  # Wait 2 minutes before logging disconnect
@@ -711,7 +713,48 @@ def format_duration(seconds):
     else:
         return f"{secs}s"
 
-def get_geoip(ip):
+def _do_geoip_lookup(check_ip):
+    """Background thread worker for GeoIP lookups."""
+    try:
+        import urllib.request
+        url = f"http://ip-api.com/json/{check_ip}?fields=status,country,countryCode,city,isp,lat,lon"
+        with urllib.request.urlopen(url, timeout=1) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get('status') == 'success':
+                result = {
+                    'country': data.get('country', ''),
+                    'country_code': data.get('countryCode', '').lower(),
+                    'city': data.get('city', ''),
+                    'isp': data.get('isp', ''),
+                    'lat': data.get('lat'),
+                    'lon': data.get('lon'),
+                    '_time': time.time(),
+                    '_failed': False
+                }
+                with GEOIP_LOCK:
+                    GEOIP_CACHE[check_ip] = result
+            else:
+                # API returned failure - cache negative result for 5 minutes
+                with GEOIP_LOCK:
+                    GEOIP_CACHE[check_ip] = {'_time': time.time(), '_failed': True}
+    except Exception as e:
+        logger.debug(f"GeoIP lookup failed for {check_ip}: {e}")
+        # Cache negative result for 5 minutes to avoid repeated failures
+        with GEOIP_LOCK:
+            GEOIP_CACHE[check_ip] = {'_time': time.time(), '_failed': True}
+    finally:
+        with GEOIP_LOCK:
+            GEOIP_PENDING.discard(check_ip)
+
+
+def get_geoip(ip, blocking=False):
+    """Get GeoIP data for an IP address.
+
+    By default (blocking=False), returns cached data immediately or None,
+    and queues a background lookup if needed. This prevents API blocking.
+
+    With blocking=True, performs synchronous lookup (use sparingly).
+    """
     if not ip:
         return None
 
@@ -726,20 +769,51 @@ def get_geoip(ip):
     if check_ip.startswith('172.'):
         parts = check_ip.split('.')
         if len(parts) >= 2:
-            second_octet = int(parts[1])
-            if 16 <= second_octet <= 31:
+            try:
+                second_octet = int(parts[1])
+                if 16 <= second_octet <= 31:
+                    return None
+            except ValueError:
                 return None
 
-    if check_ip in GEOIP_CACHE:
-        cached = GEOIP_CACHE[check_ip]
-        # Cache for 1 hour
-        if cached.get('_time', 0) > time.time() - 3600:
-            return cached
-    
+    with GEOIP_LOCK:
+        if check_ip in GEOIP_CACHE:
+            cached = GEOIP_CACHE[check_ip]
+            cache_age = time.time() - cached.get('_time', 0)
+
+            # Check if this is a negative (failed) cache entry
+            if cached.get('_failed'):
+                # Negative cache for 5 minutes
+                if cache_age < 300:
+                    return None
+                # Expired negative cache - remove and allow retry
+                del GEOIP_CACHE[check_ip]
+            else:
+                # Positive cache for 1 hour
+                if cache_age < 3600:
+                    return cached
+                # Expired positive cache - but return stale data while refreshing
+                # This prevents blocking while we update in background
+                if check_ip not in GEOIP_PENDING:
+                    GEOIP_PENDING.add(check_ip)
+                    thread = threading.Thread(target=_do_geoip_lookup, args=(check_ip,), daemon=True)
+                    thread.start()
+                return cached
+
+    # Not in cache - queue background lookup (non-blocking by default)
+    if not blocking:
+        with GEOIP_LOCK:
+            if check_ip not in GEOIP_PENDING:
+                GEOIP_PENDING.add(check_ip)
+                thread = threading.Thread(target=_do_geoip_lookup, args=(check_ip,), daemon=True)
+                thread.start()
+        return None
+
+    # Blocking mode - do synchronous lookup (used sparingly)
     try:
         import urllib.request
         url = f"http://ip-api.com/json/{check_ip}?fields=status,country,countryCode,city,isp,lat,lon"
-        with urllib.request.urlopen(url, timeout=2) as resp:
+        with urllib.request.urlopen(url, timeout=1) as resp:
             data = json.loads(resp.read().decode())
             if data.get('status') == 'success':
                 result = {
@@ -749,12 +823,16 @@ def get_geoip(ip):
                     'isp': data.get('isp', ''),
                     'lat': data.get('lat'),
                     'lon': data.get('lon'),
-                    '_time': time.time()
+                    '_time': time.time(),
+                    '_failed': False
                 }
-                GEOIP_CACHE[check_ip] = result
+                with GEOIP_LOCK:
+                    GEOIP_CACHE[check_ip] = result
                 return result
     except Exception as e:
         logger.debug(f"GeoIP lookup failed for {check_ip}: {e}")
+        with GEOIP_LOCK:
+            GEOIP_CACHE[check_ip] = {'_time': time.time(), '_failed': True}
 
     return None
 
@@ -2905,19 +2983,40 @@ TEMPLATE = '''
             let mapExpanded = localStorage.getItem('mapExpanded') === 'true'; // Default to collapsed (false)
             let sessionExpired = false;  // Track if session has expired to prevent spam
 
+            // Request cancellation - prevents request stacking
+            let currentRefreshController = null;  // AbortController for current refresh request
+            let currentHealthController = null;   // AbortController for current health request
+            let consecutiveErrors = 0;            // Track consecutive errors for backoff
+            const MAX_BACKOFF_MULTIPLIER = 4;     // Max backoff: 5s * 4 = 20s between retries
+
             // ===== API Fetch Helper =====
             // Centralized fetch handler with timeout, auth handling, and comprehensive error handling
-            const API_TIMEOUT_MS = 10000;  // 10 second timeout for API calls
+            const API_TIMEOUT_MS = 15000;  // 15 second timeout for API calls (increased for slower connections)
 
             function apiFetch(url, options = {}) {
                 // Create abort controller for timeout
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+                const timeoutController = new AbortController();
+                const timeoutId = setTimeout(() => timeoutController.abort(), API_TIMEOUT_MS);
 
-                // Merge abort signal into options
+                // If caller provided an external signal, listen for it to abort
+                const externalSignal = options.signal;
+                if (externalSignal) {
+                    // If already aborted, abort immediately
+                    if (externalSignal.aborted) {
+                        clearTimeout(timeoutId);
+                        return Promise.reject(new DOMException('Aborted', 'AbortError'));
+                    }
+                    // Listen for external abort and propagate to timeout controller
+                    externalSignal.addEventListener('abort', () => {
+                        clearTimeout(timeoutId);
+                        timeoutController.abort();
+                    });
+                }
+
+                // Use the timeout controller's signal (it will be aborted by either timeout or external signal)
                 const fetchOptions = {
                     ...options,
-                    signal: controller.signal
+                    signal: timeoutController.signal
                 };
 
                 return fetch(url, fetchOptions)
@@ -2951,8 +3050,13 @@ TEMPLATE = '''
                     .catch(err => {
                         clearTimeout(timeoutId);
 
-                        // Handle abort/timeout
+                        // Handle abort - could be timeout or external cancellation
                         if (err.name === 'AbortError') {
+                            // Check if it was cancelled externally (not timeout)
+                            if (externalSignal && externalSignal.aborted) {
+                                throw err;  // Re-throw as AbortError for caller to handle
+                            }
+                            // It was a timeout
                             console.error('API request timed out:', url);
                             throw new Error('Request timed out - server not responding');
                         }
@@ -3183,11 +3287,19 @@ TEMPLATE = '''
             }
 
             function fetchHealth() {
+                // Cancel any in-flight health request to prevent stacking
+                if (currentHealthController) {
+                    currentHealthController.abort();
+                }
+                currentHealthController = new AbortController();
+
                 // Add cache-busting timestamp to prevent browser caching
-                apiFetch('/api/health?_t=' + Date.now())
+                apiFetch('/api/health?_t=' + Date.now(), { signal: currentHealthController.signal })
                     .then(safeParseJSON)
                     .then(updateHealthCard)
                     .catch(err => {
+                        // Ignore aborted requests
+                        if (err.name === 'AbortError') return;
                         if (err.message === 'Session expired') return;  // Already handled
                         console.error('Health check failed:', err.message);
                         updateHealthCard({ overall: 'down', checks: [{ name: 'API', status: 'fail', detail: err.message || 'Unable to fetch health status' }] });
@@ -3984,12 +4096,21 @@ TEMPLATE = '''
                 // Skip refresh if session has expired (prevents spam)
                 if (sessionExpired) return;
 
+                // Cancel any in-flight refresh request to prevent stacking
+                if (currentRefreshController) {
+                    currentRefreshController.abort();
+                }
+                currentRefreshController = new AbortController();
+
                 // Add cache-busting timestamp to prevent browser caching
-                apiFetch('/api/status?_t=' + Date.now())
+                apiFetch('/api/status?_t=' + Date.now(), { signal: currentRefreshController.signal })
                     .then(safeParseJSON)
                     .then(data => {
                         // Mark initial load complete (stops loading timeout checker)
                         initialLoadComplete = true;
+
+                        // Reset error count on success
+                        consecutiveErrors = 0;
 
                         currentStats = data.stats;
                         allClients = data.clients || [];
@@ -4010,8 +4131,13 @@ TEMPLATE = '''
                         document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
                     })
                     .catch(err => {
+                        // Ignore aborted requests (we cancelled them intentionally)
+                        if (err.name === 'AbortError') return;
                         if (err.message === 'Session expired') return;  // Already handled by apiFetch
-                        console.error('Refresh failed:', err.message);
+
+                        // Increment error count for backoff
+                        consecutiveErrors = Math.min(consecutiveErrors + 1, MAX_BACKOFF_MULTIPLIER);
+                        console.error('Refresh failed:', err.message, `(backoff: ${consecutiveErrors}x)`);
                         // Show user-friendly error with retry option
                         showApiError(err.message || 'Failed to load data. Check server connection.', true);
                     });
@@ -4277,16 +4403,43 @@ TEMPLATE = '''
             // Check for updates after 5 seconds
             setTimeout(checkForUpdates, 5000);
 
-            // Auto-refresh intervals
-            setInterval(() => {
-                try { refreshDashboard(); } catch (e) { console.error('Refresh error:', e); }
-            }, 5000);
-            setInterval(() => {
-                try { fetchHealth(); } catch (e) { console.error('Health error:', e); }
-            }, 30000);
-            setInterval(() => {
-                try { updateActivitySection(); } catch (e) { console.error('Activity error:', e); }
-            }, 15000);
+            // Smart polling with backoff - uses setTimeout instead of setInterval
+            // to allow dynamic interval adjustment based on errors
+            const BASE_REFRESH_INTERVAL = 5000;
+            const BASE_HEALTH_INTERVAL = 30000;
+            const BASE_ACTIVITY_INTERVAL = 15000;
+
+            function scheduleRefresh() {
+                // Calculate interval with backoff: base * (1 + errors), capped at 4x
+                const backoffMultiplier = 1 + consecutiveErrors;
+                const interval = Math.min(BASE_REFRESH_INTERVAL * backoffMultiplier, BASE_REFRESH_INTERVAL * MAX_BACKOFF_MULTIPLIER);
+                setTimeout(() => {
+                    try { refreshDashboard(); } catch (e) { console.error('Refresh error:', e); }
+                    scheduleRefresh();  // Schedule next refresh
+                }, interval);
+            }
+
+            function scheduleHealth() {
+                // Health check is less critical, so give it more backoff time on errors
+                const interval = consecutiveErrors > 0 ? BASE_HEALTH_INTERVAL * 2 : BASE_HEALTH_INTERVAL;
+                setTimeout(() => {
+                    try { fetchHealth(); } catch (e) { console.error('Health error:', e); }
+                    scheduleHealth();
+                }, interval);
+            }
+
+            function scheduleActivity() {
+                const interval = consecutiveErrors > 0 ? BASE_ACTIVITY_INTERVAL * 2 : BASE_ACTIVITY_INTERVAL;
+                setTimeout(() => {
+                    try { updateActivitySection(); } catch (e) { console.error('Activity error:', e); }
+                    scheduleActivity();
+                }, interval);
+            }
+
+            // Start the smart polling loops
+            scheduleRefresh();
+            scheduleHealth();
+            scheduleActivity();
         </script>
         {% endif %}
     </div>
