@@ -2991,8 +2991,16 @@ TEMPLATE = '''
             // Request cancellation - prevents request stacking
             let currentRefreshController = null;  // AbortController for current refresh request
             let currentHealthController = null;   // AbortController for current health request
+            let currentActivityController = null; // AbortController for current activity request
             let consecutiveErrors = 0;            // Track consecutive errors for backoff
             const MAX_BACKOFF_MULTIPLIER = 4;     // Max backoff: 5s * 4 = 20s between retries
+
+            // Polling state management - prevents duplicate polling chains
+            let pollingActive = false;
+            let loadingTimeoutId = null;          // Track loading timeout for cleanup
+            let refreshTimeoutId = null;          // Track polling timeouts for cleanup
+            let healthTimeoutId = null;
+            let activityTimeoutId = null;
 
             // ===== API Fetch Helper =====
             // Centralized fetch handler with timeout, auth handling, and comprehensive error handling
@@ -3138,26 +3146,11 @@ TEMPLATE = '''
             }
 
             function retryLoad() {
-                // Reset all error state flags and retry
-                sessionExpired = false;  // Allow retry even if previously marked expired
-                initialLoadComplete = false;
-                consecutiveErrors = 0;
-                loadingStartTime = Date.now();
-                // Reset UI to loading state
-                document.getElementById('stats-grid').innerHTML = `
-                    <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
-                `;
-                document.getElementById('client-grid').innerHTML = `
-                    <div class="empty-state">Loading clients...</div>
-                `;
-                const activityList = document.getElementById('activityList');
-                if (activityList) {
-                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Loading activity...</div>';
-                }
-                // Trigger fresh data load
-                refreshDashboard();
-                fetchHealth();
-                updateActivitySection();
+                console.log('Retrying load...');
+                // Clean up any pending requests and timeouts
+                cleanupPageState();
+                // Reinitialize the page (resets state, UI, and starts fresh data load)
+                reinitializePageState();
             }
 
             // ===== Loading Timeout =====
@@ -3166,38 +3159,131 @@ TEMPLATE = '''
             let initialLoadComplete = false;
 
             function checkLoadingTimeout() {
-                if (initialLoadComplete || sessionExpired) return;
+                // Stop checking if load completed, session expired, or timeout was cancelled
+                if (initialLoadComplete || sessionExpired) {
+                    loadingTimeoutId = null;
+                    return;
+                }
 
                 const elapsed = Date.now() - loadingStartTime;
                 if (elapsed > LOADING_TIMEOUT_MS) {
                     console.error('Loading timeout - UI stuck for', elapsed, 'ms');
                     showApiError('Loading timed out. The server may be unreachable or slow.', true);
+                    loadingTimeoutId = null;
+                    return;
                 }
+
+                // Schedule next check (using setTimeout for control, not setInterval)
+                loadingTimeoutId = setTimeout(checkLoadingTimeout, 5000);
             }
 
-            // Check for loading timeout every 5 seconds
-            setInterval(checkLoadingTimeout, 5000);
+            // Start loading timeout check (will self-schedule until complete)
+            loadingTimeoutId = setTimeout(checkLoadingTimeout, 5000);
 
-            // ===== BFcache (Back-Forward Cache) Handler =====
-            // Safari and other browsers cache the entire page state including JS variables
-            // When restored from BFcache, we need to refresh data and reset state
+            // ===== Page Lifecycle Management =====
+            // Handles Safari BFcache, page refresh, and tab restoration
+
+            // Cleanup function to abort all pending requests and clear timeouts
+            function cleanupPageState() {
+                console.log('Cleaning up page state...');
+
+                // Abort all in-flight requests
+                if (currentRefreshController) {
+                    currentRefreshController.abort();
+                    currentRefreshController = null;
+                }
+                if (currentHealthController) {
+                    currentHealthController.abort();
+                    currentHealthController = null;
+                }
+                if (currentActivityController) {
+                    currentActivityController.abort();
+                    currentActivityController = null;
+                }
+
+                // Clear all pending timeouts
+                if (loadingTimeoutId) {
+                    clearTimeout(loadingTimeoutId);
+                    loadingTimeoutId = null;
+                }
+                if (refreshTimeoutId) {
+                    clearTimeout(refreshTimeoutId);
+                    refreshTimeoutId = null;
+                }
+                if (healthTimeoutId) {
+                    clearTimeout(healthTimeoutId);
+                    healthTimeoutId = null;
+                }
+                if (activityTimeoutId) {
+                    clearTimeout(activityTimeoutId);
+                    activityTimeoutId = null;
+                }
+
+                // Mark polling as inactive so it can be restarted
+                pollingActive = false;
+            }
+
+            // Reinitialize page state after restore/refresh
+            function reinitializePageState() {
+                console.log('Reinitializing page state...');
+
+                // Reset state flags
+                sessionExpired = false;
+                initialLoadComplete = false;
+                loadingStartTime = Date.now();
+                consecutiveErrors = 0;
+
+                // Reset UI to loading state
+                const statsGrid = document.getElementById('stats-grid');
+                const clientGrid = document.getElementById('client-grid');
+                const activityList = document.getElementById('activityList');
+
+                if (statsGrid) {
+                    statsGrid.innerHTML = '<div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>';
+                }
+                if (clientGrid) {
+                    clientGrid.innerHTML = '<div class="empty-state">Loading clients...</div>';
+                }
+                if (activityList) {
+                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Loading activity...</div>';
+                }
+
+                // Restart loading timeout checker
+                loadingTimeoutId = setTimeout(checkLoadingTimeout, 5000);
+
+                // Load fresh data
+                Promise.all([
+                    refreshDashboard(),
+                    fetchHealth(),
+                    updateActivitySection()
+                ]).then(() => {
+                    console.log('Page reinitialization complete');
+                    // Start polling if not already active
+                    if (!pollingActive) {
+                        pollingActive = true;
+                        scheduleRefresh();
+                        scheduleHealth();
+                        scheduleActivity();
+                    }
+                }).catch(err => {
+                    console.error('Page reinitialization error:', err);
+                });
+            }
+
+            // Handle page hide (before BFcache storage)
+            window.addEventListener('pagehide', function(event) {
+                if (event.persisted) {
+                    console.log('Page being stored in BFcache, cleaning up...');
+                    cleanupPageState();
+                }
+            });
+
+            // Handle page show (BFcache restore or initial load)
             window.addEventListener('pageshow', function(event) {
                 if (event.persisted) {
-                    console.log('Page restored from BFcache, refreshing data...');
-                    // Reset state flags
-                    sessionExpired = false;
-                    initialLoadComplete = false;
-                    loadingStartTime = Date.now();
-                    consecutiveErrors = 0;
-                    // Reset UI to loading state
-                    const statsGrid = document.getElementById('stats-grid');
-                    const clientGrid = document.getElementById('client-grid');
-                    if (statsGrid) statsGrid.innerHTML = '<div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>';
-                    if (clientGrid) clientGrid.innerHTML = '<div class="empty-state">Loading clients...</div>';
-                    // Force fresh data load
-                    refreshDashboard();
-                    fetchHealth();
-                    updateActivitySection();
+                    console.log('Page restored from BFcache, reinitializing...');
+                    cleanupPageState();  // Ensure clean state
+                    reinitializePageState();
                 }
             });
 
@@ -3435,9 +3521,15 @@ TEMPLATE = '''
                 // Skip activity fetch if session has expired
                 if (sessionExpired) return Promise.resolve();
 
+                // Cancel any in-flight activity request to prevent stacking
+                if (currentActivityController) {
+                    currentActivityController.abort();
+                }
+                currentActivityController = new AbortController();
+
                 // Add cache-busting timestamp to prevent browser caching
                 // Return the promise chain for proper async handling
-                return apiFetch('/api/history?_t=' + Date.now())
+                return apiFetch('/api/history?_t=' + Date.now(), { signal: currentActivityController.signal })
                     .then(safeParseJSON)
                     .then(data => {
                         const list = document.getElementById('activityList');
@@ -4480,10 +4572,24 @@ TEMPLATE = '''
                     updateActivitySection()
                 ]).then(() => {
                     console.log('Initial load complete');
+                    // Start polling after successful initial load
+                    if (!pollingActive) {
+                        pollingActive = true;
+                        scheduleRefresh();
+                        scheduleHealth();
+                        scheduleActivity();
+                    }
                 }).catch(err => {
                     // Individual functions handle their own errors
                     // This catch is for any unexpected errors
                     console.error('Initial load error:', err);
+                    // Still start polling to allow recovery
+                    if (!pollingActive) {
+                        pollingActive = true;
+                        scheduleRefresh();
+                        scheduleHealth();
+                        scheduleActivity();
+                    }
                 });
             })();
 
@@ -4492,20 +4598,26 @@ TEMPLATE = '''
 
             // Smart polling with backoff - uses setTimeout instead of setInterval
             // to allow dynamic interval adjustment based on errors
-            // Polling stops when session expires
+            // Polling stops when session expires or pollingActive is false
             const BASE_REFRESH_INTERVAL = 5000;
             const BASE_HEALTH_INTERVAL = 30000;
             const BASE_ACTIVITY_INTERVAL = 15000;
 
             function scheduleRefresh() {
-                // Stop polling if session expired
-                if (sessionExpired) return;
+                // Stop polling if session expired or polling deactivated
+                if (sessionExpired || !pollingActive) {
+                    refreshTimeoutId = null;
+                    return;
+                }
 
                 // Calculate interval with backoff: base * (1 + errors), capped at 4x
                 const backoffMultiplier = 1 + consecutiveErrors;
                 const interval = Math.min(BASE_REFRESH_INTERVAL * backoffMultiplier, BASE_REFRESH_INTERVAL * MAX_BACKOFF_MULTIPLIER);
-                setTimeout(() => {
-                    if (sessionExpired) return;  // Double-check before executing
+                refreshTimeoutId = setTimeout(() => {
+                    if (sessionExpired || !pollingActive) {
+                        refreshTimeoutId = null;
+                        return;
+                    }
                     refreshDashboard()
                         .catch(e => console.error('Refresh error:', e))
                         .finally(() => scheduleRefresh());  // Schedule next after completion
@@ -4513,13 +4625,19 @@ TEMPLATE = '''
             }
 
             function scheduleHealth() {
-                // Stop polling if session expired
-                if (sessionExpired) return;
+                // Stop polling if session expired or polling deactivated
+                if (sessionExpired || !pollingActive) {
+                    healthTimeoutId = null;
+                    return;
+                }
 
                 // Health check is less critical, so give it more backoff time on errors
                 const interval = consecutiveErrors > 0 ? BASE_HEALTH_INTERVAL * 2 : BASE_HEALTH_INTERVAL;
-                setTimeout(() => {
-                    if (sessionExpired) return;  // Double-check before executing
+                healthTimeoutId = setTimeout(() => {
+                    if (sessionExpired || !pollingActive) {
+                        healthTimeoutId = null;
+                        return;
+                    }
                     fetchHealth()
                         .catch(e => console.error('Health error:', e))
                         .finally(() => scheduleHealth());  // Schedule next after completion
@@ -4527,22 +4645,25 @@ TEMPLATE = '''
             }
 
             function scheduleActivity() {
-                // Stop polling if session expired
-                if (sessionExpired) return;
+                // Stop polling if session expired or polling deactivated
+                if (sessionExpired || !pollingActive) {
+                    activityTimeoutId = null;
+                    return;
+                }
 
                 const interval = consecutiveErrors > 0 ? BASE_ACTIVITY_INTERVAL * 2 : BASE_ACTIVITY_INTERVAL;
-                setTimeout(() => {
-                    if (sessionExpired) return;  // Double-check before executing
+                activityTimeoutId = setTimeout(() => {
+                    if (sessionExpired || !pollingActive) {
+                        activityTimeoutId = null;
+                        return;
+                    }
                     updateActivitySection()
                         .catch(e => console.error('Activity error:', e))
                         .finally(() => scheduleActivity());  // Schedule next after completion
                 }, interval);
             }
 
-            // Start the smart polling loops
-            scheduleRefresh();
-            scheduleHealth();
-            scheduleActivity();
+            // Note: Polling is started after initial load completes (see performInitialLoad above)
         </script>
         {% endif %}
     </div>
