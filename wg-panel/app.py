@@ -79,15 +79,20 @@ def set_cache_headers(response):
 
     This fixes the issue where browsers (especially Safari) cache responses
     aggressively, requiring users to clear website data to access the app.
+    Also addresses Safari's BFcache (Back-Forward Cache) serving stale pages.
     """
+    # Always add Vary: Cookie to ensure cache respects session state changes
+    # This prevents serving cached responses when session state has changed
+    response.headers['Vary'] = 'Cookie'
+
     # For API endpoints - never cache dynamic data
     if request.path.startswith('/api/'):
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, private, max-age=0'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
     # For main page and auth routes - prevent stale HTML
     elif request.path in ('/', '/login', '/logout'):
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, private, max-age=0'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
     # For QR codes and configs - short cache, revalidate
@@ -3014,9 +3019,11 @@ TEMPLATE = '''
                 }
 
                 // Use the timeout controller's signal (it will be aborted by either timeout or external signal)
+                // Always include credentials to ensure session cookies are sent
                 const fetchOptions = {
                     ...options,
-                    signal: timeoutController.signal
+                    signal: timeoutController.signal,
+                    credentials: 'same-origin'
                 };
 
                 return fetch(url, fetchOptions)
@@ -3131,21 +3138,30 @@ TEMPLATE = '''
             }
 
             function retryLoad() {
-                // Reset error state and retry
+                // Reset all error state flags and retry
+                sessionExpired = false;  // Allow retry even if previously marked expired
+                initialLoadComplete = false;
+                consecutiveErrors = 0;
+                loadingStartTime = Date.now();
+                // Reset UI to loading state
                 document.getElementById('stats-grid').innerHTML = `
                     <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
                 `;
                 document.getElementById('client-grid').innerHTML = `
                     <div class="empty-state">Loading clients...</div>
                 `;
-                loadingStartTime = Date.now();
+                const activityList = document.getElementById('activityList');
+                if (activityList) {
+                    activityList.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">Loading activity...</div>';
+                }
+                // Trigger fresh data load
                 refreshDashboard();
                 fetchHealth();
                 updateActivitySection();
             }
 
             // ===== Loading Timeout =====
-            const LOADING_TIMEOUT_MS = 15000;  // 15 seconds before showing error
+            const LOADING_TIMEOUT_MS = 20000;  // 20 seconds before showing error (increased for slow connections)
             let loadingStartTime = Date.now();
             let initialLoadComplete = false;
 
@@ -3155,12 +3171,51 @@ TEMPLATE = '''
                 const elapsed = Date.now() - loadingStartTime;
                 if (elapsed > LOADING_TIMEOUT_MS) {
                     console.error('Loading timeout - UI stuck for', elapsed, 'ms');
-                    showApiError('Loading timed out. The server may be unreachable.', true);
+                    showApiError('Loading timed out. The server may be unreachable or slow.', true);
                 }
             }
 
             // Check for loading timeout every 5 seconds
             setInterval(checkLoadingTimeout, 5000);
+
+            // ===== BFcache (Back-Forward Cache) Handler =====
+            // Safari and other browsers cache the entire page state including JS variables
+            // When restored from BFcache, we need to refresh data and reset state
+            window.addEventListener('pageshow', function(event) {
+                if (event.persisted) {
+                    console.log('Page restored from BFcache, refreshing data...');
+                    // Reset state flags
+                    sessionExpired = false;
+                    initialLoadComplete = false;
+                    loadingStartTime = Date.now();
+                    consecutiveErrors = 0;
+                    // Reset UI to loading state
+                    const statsGrid = document.getElementById('stats-grid');
+                    const clientGrid = document.getElementById('client-grid');
+                    if (statsGrid) statsGrid.innerHTML = '<div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>';
+                    if (clientGrid) clientGrid.innerHTML = '<div class="empty-state">Loading clients...</div>';
+                    // Force fresh data load
+                    refreshDashboard();
+                    fetchHealth();
+                    updateActivitySection();
+                }
+            });
+
+            // ===== Visibility Change Handler =====
+            // Refresh data when tab becomes visible after being hidden
+            let lastVisibilityChange = Date.now();
+            document.addEventListener('visibilitychange', function() {
+                if (document.visibilityState === 'visible' && !sessionExpired) {
+                    const hiddenDuration = Date.now() - lastVisibilityChange;
+                    // If page was hidden for more than 30 seconds, refresh data
+                    if (hiddenDuration > 30000) {
+                        console.log('Tab visible after ' + Math.round(hiddenDuration/1000) + 's, refreshing data...');
+                        refreshDashboard();
+                        fetchHealth();
+                    }
+                }
+                lastVisibilityChange = Date.now();
+            });
 
             // ===== Theme =====
             function toggleTheme() {
@@ -3287,6 +3342,9 @@ TEMPLATE = '''
             }
 
             function fetchHealth() {
+                // Skip health check if session has expired
+                if (sessionExpired) return Promise.resolve();
+
                 // Cancel any in-flight health request to prevent stacking
                 if (currentHealthController) {
                     currentHealthController.abort();
@@ -3294,9 +3352,13 @@ TEMPLATE = '''
                 currentHealthController = new AbortController();
 
                 // Add cache-busting timestamp to prevent browser caching
-                apiFetch('/api/health?_t=' + Date.now(), { signal: currentHealthController.signal })
+                // Return the promise chain for proper async handling
+                return apiFetch('/api/health?_t=' + Date.now(), { signal: currentHealthController.signal })
                     .then(safeParseJSON)
-                    .then(updateHealthCard)
+                    .then(data => {
+                        updateHealthCard(data);
+                        return data;  // Return data for promise chaining
+                    })
                     .catch(err => {
                         // Ignore aborted requests
                         if (err.name === 'AbortError') return;
@@ -3370,8 +3432,12 @@ TEMPLATE = '''
             }
 
             function updateActivitySection() {
+                // Skip activity fetch if session has expired
+                if (sessionExpired) return Promise.resolve();
+
                 // Add cache-busting timestamp to prevent browser caching
-                apiFetch('/api/history?_t=' + Date.now())
+                // Return the promise chain for proper async handling
+                return apiFetch('/api/history?_t=' + Date.now())
                     .then(safeParseJSON)
                     .then(data => {
                         const list = document.getElementById('activityList');
@@ -3380,7 +3446,7 @@ TEMPLATE = '''
                         if (data.length === 0) {
                             list.innerHTML = '<div class="activity-row" style="justify-content:center;color:var(--text-secondary);">No recent activity</div>';
                             count.textContent = '';
-                            return;
+                            return data;
                         }
 
                         count.textContent = `${data.length} events`;
@@ -3407,8 +3473,11 @@ TEMPLATE = '''
                                 </div>
                             `;
                         }).join('');
+
+                        return data;  // Return data for promise chaining
                     })
                     .catch(err => {
+                        if (err.name === 'AbortError') return;
                         if (err.message === 'Session expired') return;  // Already handled
                         console.error('Activity fetch failed:', err);
                         const list = document.getElementById('activityList');
@@ -4094,7 +4163,7 @@ TEMPLATE = '''
             // ===== Dashboard Refresh =====
             function refreshDashboard() {
                 // Skip refresh if session has expired (prevents spam)
-                if (sessionExpired) return;
+                if (sessionExpired) return Promise.resolve();
 
                 // Cancel any in-flight refresh request to prevent stacking
                 if (currentRefreshController) {
@@ -4103,7 +4172,8 @@ TEMPLATE = '''
                 currentRefreshController = new AbortController();
 
                 // Add cache-busting timestamp to prevent browser caching
-                apiFetch('/api/status?_t=' + Date.now(), { signal: currentRefreshController.signal })
+                // Return the promise chain for proper async handling
+                return apiFetch('/api/status?_t=' + Date.now(), { signal: currentRefreshController.signal })
                     .then(safeParseJSON)
                     .then(data => {
                         // Mark initial load complete (stops loading timeout checker)
@@ -4129,6 +4199,8 @@ TEMPLATE = '''
                         const geoCount = clients.filter(c => c.geo && c.geo.lat).length;
                         const connectedGeo = clients.filter(c => c.connected && c.geo && c.geo.lat).length;
                         document.getElementById('mapClientCount').textContent = `(${connectedGeo} connected, ${geoCount} with location)`;
+
+                        return data;  // Return data for promise chaining
                     })
                     .catch(err => {
                         // Ignore aborted requests (we cancelled them intentionally)
@@ -4138,8 +4210,12 @@ TEMPLATE = '''
                         // Increment error count for backoff
                         consecutiveErrors = Math.min(consecutiveErrors + 1, MAX_BACKOFF_MULTIPLIER);
                         console.error('Refresh failed:', err.message, `(backoff: ${consecutiveErrors}x)`);
-                        // Show user-friendly error with retry option
-                        showApiError(err.message || 'Failed to load data. Check server connection.', true);
+
+                        // Only show error UI if initial load hasn't completed
+                        // (don't spam errors during normal polling)
+                        if (!initialLoadComplete) {
+                            showApiError(err.message || 'Failed to load data. Check server connection.', true);
+                        }
                     });
             }
 
@@ -4392,47 +4468,74 @@ TEMPLATE = '''
             }
 
             // ===== Initial Load =====
-            try {
-                refreshDashboard();
-                fetchHealth();
-                updateActivitySection();
-            } catch (e) {
-                console.error('Initial load error:', e);
-            }
+            // Perform initial data load with proper error handling using Promise.all
+            (function performInitialLoad() {
+                console.log('Starting initial load...');
+                loadingStartTime = Date.now();
+
+                // Load all data in parallel
+                Promise.all([
+                    refreshDashboard(),
+                    fetchHealth(),
+                    updateActivitySection()
+                ]).then(() => {
+                    console.log('Initial load complete');
+                }).catch(err => {
+                    // Individual functions handle their own errors
+                    // This catch is for any unexpected errors
+                    console.error('Initial load error:', err);
+                });
+            })();
 
             // Check for updates after 5 seconds
             setTimeout(checkForUpdates, 5000);
 
             // Smart polling with backoff - uses setTimeout instead of setInterval
             // to allow dynamic interval adjustment based on errors
+            // Polling stops when session expires
             const BASE_REFRESH_INTERVAL = 5000;
             const BASE_HEALTH_INTERVAL = 30000;
             const BASE_ACTIVITY_INTERVAL = 15000;
 
             function scheduleRefresh() {
+                // Stop polling if session expired
+                if (sessionExpired) return;
+
                 // Calculate interval with backoff: base * (1 + errors), capped at 4x
                 const backoffMultiplier = 1 + consecutiveErrors;
                 const interval = Math.min(BASE_REFRESH_INTERVAL * backoffMultiplier, BASE_REFRESH_INTERVAL * MAX_BACKOFF_MULTIPLIER);
                 setTimeout(() => {
-                    try { refreshDashboard(); } catch (e) { console.error('Refresh error:', e); }
-                    scheduleRefresh();  // Schedule next refresh
+                    if (sessionExpired) return;  // Double-check before executing
+                    refreshDashboard()
+                        .catch(e => console.error('Refresh error:', e))
+                        .finally(() => scheduleRefresh());  // Schedule next after completion
                 }, interval);
             }
 
             function scheduleHealth() {
+                // Stop polling if session expired
+                if (sessionExpired) return;
+
                 // Health check is less critical, so give it more backoff time on errors
                 const interval = consecutiveErrors > 0 ? BASE_HEALTH_INTERVAL * 2 : BASE_HEALTH_INTERVAL;
                 setTimeout(() => {
-                    try { fetchHealth(); } catch (e) { console.error('Health error:', e); }
-                    scheduleHealth();
+                    if (sessionExpired) return;  // Double-check before executing
+                    fetchHealth()
+                        .catch(e => console.error('Health error:', e))
+                        .finally(() => scheduleHealth());  // Schedule next after completion
                 }, interval);
             }
 
             function scheduleActivity() {
+                // Stop polling if session expired
+                if (sessionExpired) return;
+
                 const interval = consecutiveErrors > 0 ? BASE_ACTIVITY_INTERVAL * 2 : BASE_ACTIVITY_INTERVAL;
                 setTimeout(() => {
-                    try { updateActivitySection(); } catch (e) { console.error('Activity error:', e); }
-                    scheduleActivity();
+                    if (sessionExpired) return;  // Double-check before executing
+                    updateActivitySection()
+                        .catch(e => console.error('Activity error:', e))
+                        .finally(() => scheduleActivity());  // Schedule next after completion
                 }, interval);
             }
 
