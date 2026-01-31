@@ -3028,10 +3028,12 @@ TEMPLATE = '''
 
                 // Use the timeout controller's signal (it will be aborted by either timeout or external signal)
                 // Always include credentials to ensure session cookies are sent
+                // Use cache: 'no-store' to prevent Safari from using cached responses during refresh
                 const fetchOptions = {
                     ...options,
                     signal: timeoutController.signal,
-                    credentials: 'same-origin'
+                    credentials: 'same-origin',
+                    cache: 'no-store'
                 };
 
                 return fetch(url, fetchOptions)
@@ -3183,6 +3185,9 @@ TEMPLATE = '''
             // ===== Page Lifecycle Management =====
             // Handles Safari BFcache, page refresh, and tab restoration
 
+            // Track if page has been initialized to prevent race conditions
+            let pageInitialized = false;
+
             // Cleanup function to abort all pending requests and clear timeouts
             function cleanupPageState() {
                 console.log('Cleaning up page state...');
@@ -3281,9 +3286,23 @@ TEMPLATE = '''
             // Handle page show (BFcache restore or initial load)
             window.addEventListener('pageshow', function(event) {
                 if (event.persisted) {
+                    // BFcache restore - always cleanup and reinit
                     console.log('Page restored from BFcache, reinitializing...');
-                    cleanupPageState();  // Ensure clean state
+                    pageInitialized = false;  // Reset flag so we can reinit
+                    cleanupPageState();
                     reinitializePageState();
+                    pageInitialized = true;
+                } else {
+                    // Fresh load or Safari refresh - check for stuck state after delay
+                    // Safari can have lingering network state that causes fetch to hang
+                    setTimeout(function() {
+                        if (!initialLoadComplete && !sessionExpired && !pageInitialized) {
+                            console.log('Safari refresh detected: initial load stuck, forcing reinit...');
+                            cleanupPageState();
+                            reinitializePageState();
+                            pageInitialized = true;
+                        }
+                    }, 2000);  // Give normal init 2 seconds to complete
                 }
             });
 
@@ -3298,6 +3317,7 @@ TEMPLATE = '''
                         console.log('Tab visible after ' + Math.round(hiddenDuration/1000) + 's, refreshing data...');
                         refreshDashboard();
                         fetchHealth();
+                        updateActivitySection();
                     }
                 }
                 lastVisibilityChange = Date.now();
@@ -4572,6 +4592,7 @@ TEMPLATE = '''
                     updateActivitySection()
                 ]).then(() => {
                     console.log('Initial load complete');
+                    pageInitialized = true;  // Mark as initialized to prevent recovery timer
                     // Start polling after successful initial load
                     if (!pollingActive) {
                         pollingActive = true;
@@ -4583,6 +4604,7 @@ TEMPLATE = '''
                     // Individual functions handle their own errors
                     // This catch is for any unexpected errors
                     console.error('Initial load error:', err);
+                    // Don't mark as initialized - let recovery timer handle it
                     // Still start polling to allow recovery
                     if (!pollingActive) {
                         pollingActive = true;
