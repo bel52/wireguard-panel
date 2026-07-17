@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 """
-LeathGuard v4 - WireGuard Web Panel
+LeathGuard v6 - WireGuard Web Panel
 
-Features:
-- Realtime auto-refresh (5 second polling)
-- Connection status with 5-minute threshold
-- Connection duration tracking ("Connected for 2d 5h 12m")
-- Per-client bandwidth sparklines (30-60 sec window, showing deltas)
-- Last seen timestamps for offline clients
-- Client notes/descriptions
-- Connection history logging
-- GeoIP endpoint location
-- Dark/light mode toggle
-- Mobile-friendly responsive design
-- Health & Risk monitoring
-- Rolling window traffic stats (1h/24h)
-- Demo-safe mode for presentations
-- Collapsible map view
+v6.0.0 architecture:
+- A single background Collector thread owns ALL WireGuard polling, session
+  state, bandwidth deltas, and database writes (one transaction per cycle).
+- HTTP API endpoints are read-only: they serve an immutable in-memory
+  snapshot published by the collector. N concurrent viewers cost nothing
+  and cannot corrupt sampling state.
+- Data collection runs continuously regardless of whether a browser is open.
+- Health checks run on their own thread/cadence so slow checks never stall
+  status collection.
+- SQLite: WAL journal, busy_timeout, synchronous=FULL, single long-lived
+  writer connection (collector-owned) + short-lived readers. All request-side
+  writes are serialized behind a process-wide write lock.
+- Peer data comes from `wg show <iface> dump` (exact byte counters and epoch
+  handshake timestamps). Private/preshared keys in dump output are discarded
+  immediately and never logged.
+- All timestamps are timezone-aware UTC. Legacy naive rows are interpreted
+  as UTC on read.
+- Passwords: PBKDF2-SHA256. Legacy SHA256 hashes are verified and, when the
+  credential source is the database, transparently migrated on next login.
+- Served by waitress (bounded worker pool). Default bind 127.0.0.1 for
+  reverse-proxy/tunnel deployments; set WG_PANEL_BIND=0.0.0.0 to expose.
+
+UI features (unchanged from v5): realtime dashboard, sparklines, sessions,
+history, GeoIP map, pause/unpause, notes, dark/light mode, health panel,
+1h/24h traffic windows, demo mode, in-app updates.
 """
 
 import subprocess
 import os
 import re
+import sys
 import secrets
 import sqlite3
 import json
@@ -30,7 +41,7 @@ import threading
 import logging
 from collections import deque
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, Response, jsonify
@@ -69,7 +80,7 @@ def get_app_version():
                     return f.read().strip()
             except Exception:
                 pass
-    return '5.0.0'  # Fallback default
+    return '6.0.0'  # Fallback default
 
 APP_VERSION = get_app_version()
 
@@ -112,6 +123,24 @@ AUTH_PASS_PLAIN = os.environ.get('WG_PANEL_PASS', '')
 DB_PATH = os.environ.get('WG_PANEL_DB', '/opt/wg-panel/wg-panel.db')
 DNS_CHECK_ENABLED = os.environ.get('WG_PANEL_DNS_CHECK', '').lower() in ('1', 'true', 'yes')
 DNS_CHECK_SERVER = os.environ.get('WG_PANEL_DNS_SERVER', '10.6.0.1')
+BIND_HOST = os.environ.get('WG_PANEL_BIND', '127.0.0.1')
+WAITRESS_THREADS = int(os.environ.get('WG_PANEL_THREADS', '8'))
+
+def utcnow():
+    """Timezone-aware UTC now. All internal timestamps use this."""
+    return datetime.now(timezone.utc)
+
+def parse_iso_utc(value):
+    """Parse an ISO timestamp; treat naive values as UTC (legacy row policy)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
 
 # WireGuard config - auto-detected on startup
 WG_INTERFACE = ''
@@ -125,22 +154,33 @@ CREDENTIAL_SOURCE = ''  # Track credential source: 'env' or 'database'
 GEOIP_CACHE = {}
 GEOIP_PENDING = set()  # IPs currently being looked up in background
 GEOIP_LOCK = threading.Lock()  # Thread safety for GeoIP operations
-BANDWIDTH_CACHE = {}  # Store last known bandwidth for delta calculation
 CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
 DISCONNECT_GRACE_SECONDS = 120  # Wait 2 minutes before logging disconnect
-PENDING_DISCONNECTS = {}  # Track pending disconnects: {name: first_seen_disconnected_time}
+SESSION_RESET_THRESHOLD = 1800  # 30 minutes offline before a new session starts
 
-# Traffic ring buffer for 1h/24h stats (stores samples with timestamps)
-# Each sample: {'timestamp': epoch, 'rx': bytes, 'tx': bytes}
+# NOTE (v6): WireGuard is connectionless. "Connected" here means "handshake
+# within CONNECTION_THRESHOLD_SECONDS" - an activity heuristic, not a live
+# TCP-style connection.
+
+# Traffic ring buffer for 1h/24h stats (owned by the collector thread;
+# read under TRAFFIC_BUFFER_LOCK)
 TRAFFIC_RING_BUFFER = deque(maxlen=17280)  # 24h at 5s intervals
 TRAFFIC_BUFFER_LOCK = threading.Lock()
-LAST_TRAFFIC_SAMPLE = {'rx': 0, 'tx': 0, 'time': 0}
+
+# Process-wide serialization of request-side DB writes (collector has its
+# own dedicated writer connection; everything else takes this lock).
+DB_WRITE_LOCK = threading.Lock()
 
 # --------------- Database ---------------
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    """Connection factory. Every connection gets the same pragmas so WAL,
+    busy_timeout and durability behavior are consistent regardless of caller."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    conn.execute('PRAGMA synchronous=FULL')
     return conn
 
 def init_db():
@@ -229,14 +269,6 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
-
-def cleanup_old_samples():
-    """Remove bandwidth samples older than 2 minutes."""
-    conn = get_db()
-    conn.execute("DELETE FROM bandwidth_samples WHERE timestamp < datetime('now', '-2 minutes')")
-    conn.commit()
-    conn.close()
-
 
 def init_secret_key():
     """Initialize Flask secret key with persistence.
@@ -346,37 +378,38 @@ def update_credentials(new_username=None, new_password=None):
         True if successful, False otherwise
     """
     global AUTH_USER, AUTH_PASS_HASH, AUTH_PASS_PLAIN
-    import hashlib
 
-    conn = get_db()
-    try:
-        if new_username:
-            # Store username
-            conn.execute('''
-                INSERT OR REPLACE INTO app_settings (key, value, updated_at)
-                VALUES ('auth_username', ?, datetime('now'))
-            ''', (new_username,))
-            AUTH_USER = new_username
-            logger.info(f"Username updated to: {new_username}")
+    with DB_WRITE_LOCK:
+        conn = get_db()
+        try:
+            if new_username:
+                # Store username
+                conn.execute('''
+                    INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                    VALUES ('auth_username', ?, datetime('now'))
+                ''', (new_username,))
+                AUTH_USER = new_username
+                logger.info(f"Username updated to: {new_username}")
 
-        if new_password:
-            # Hash and store password
-            password_hash = hashlib.sha256(new_password.encode()).hexdigest()
-            conn.execute('''
-                INSERT OR REPLACE INTO app_settings (key, value, updated_at)
-                VALUES ('auth_password_hash', ?, datetime('now'))
-            ''', (password_hash,))
-            AUTH_PASS_HASH = password_hash
-            AUTH_PASS_PLAIN = ''  # Clear plain password
-            logger.info("Password updated")
+            if new_password:
+                # Hash and store password (PBKDF2-SHA256)
+                password_hash = hash_password(new_password)
+                conn.execute('''
+                    INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                    VALUES ('auth_password_hash', ?, datetime('now'))
+                ''', (password_hash,))
+                AUTH_PASS_HASH = password_hash
+                AUTH_PASS_PLAIN = ''  # Clear plain password
+                logger.info("Password updated")
 
-        conn.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update credentials: {e}")
-        return False
-    finally:
-        conn.close()
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to update credentials: {e}")
+            return False
+        finally:
+            conn.close()
 
 
 # --------------- WireGuard Auto-Detection ---------------
@@ -587,15 +620,62 @@ LOGIN_ATTEMPTS = {}
 LOGIN_RATE_LIMIT = 5  # Max attempts
 LOGIN_RATE_WINDOW = 300  # 5 minute window
 
+PBKDF2_METHOD = 'pbkdf2:sha256:600000'
+_LEGACY_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+
+def hash_password(password):
+    """Hash a password with PBKDF2-SHA256 (werkzeug format)."""
+    from werkzeug.security import generate_password_hash
+    return generate_password_hash(password, method=PBKDF2_METHOD)
+
 def check_password(password):
-    """Check password with constant-time comparison to prevent timing attacks."""
+    """Verify a password against the configured hash.
+
+    Supports:
+    - werkzeug PBKDF2 hashes ('pbkdf2:...') - current format
+    - legacy unsalted SHA256 hex digests - verified constant-time; migrated
+      to PBKDF2 on successful login when the credential source is the DB
+    - legacy plain-text env password (constant-time compare)
+
+    Returns (ok, needs_migration).
+    """
     import hashlib
     if AUTH_PASS_HASH:
-        provided_hash = hashlib.sha256(password.encode()).hexdigest()
-        # Use constant-time comparison to prevent timing attacks
-        return secrets.compare_digest(provided_hash, AUTH_PASS_HASH)
+        if AUTH_PASS_HASH.startswith('pbkdf2:') or AUTH_PASS_HASH.startswith('scrypt:'):
+            from werkzeug.security import check_password_hash
+            return check_password_hash(AUTH_PASS_HASH, password), False
+        if _LEGACY_SHA256_RE.match(AUTH_PASS_HASH):
+            provided_hash = hashlib.sha256(password.encode()).hexdigest()
+            ok = secrets.compare_digest(provided_hash, AUTH_PASS_HASH)
+            return ok, ok  # migrate legacy hash on success
+        return False, False
     # For plain password, also use constant-time comparison
-    return secrets.compare_digest(password, AUTH_PASS_PLAIN)
+    ok = secrets.compare_digest(password, AUTH_PASS_PLAIN)
+    return ok, ok if AUTH_PASS_PLAIN else False
+
+def migrate_legacy_credential(password):
+    """Re-hash a verified legacy credential to PBKDF2.
+
+    Only persists when credentials are database-sourced. Environment-sourced
+    credentials override the database on every restart (installer behavior),
+    so persisting a DB hash would be silently ignored - instead we log an
+    actionable warning once.
+    """
+    global AUTH_PASS_HASH, AUTH_PASS_PLAIN
+    if CREDENTIAL_SOURCE == 'database':
+        if update_credentials(new_password=password):
+            logger.info("Migrated legacy password hash to PBKDF2")
+    else:
+        if not getattr(migrate_legacy_credential, '_warned', False):
+            logger.warning(
+                "Password is set via a legacy environment variable "
+                "(WG_PANEL_PASS/WG_PANEL_PASS_HASH with SHA256). It cannot be "
+                "auto-migrated to PBKDF2. Update the systemd unit: replace "
+                "WG_PANEL_PASS_HASH with a PBKDF2 hash "
+                "(python3 -c \"from werkzeug.security import generate_password_hash; "
+                "print(generate_password_hash('YOURPASS', method='%s'))\") "
+                "or remove the env vars and set the password via the web UI." % PBKDF2_METHOD)
+            migrate_legacy_credential._warned = True
 
 def is_rate_limited(ip):
     """Check if IP has exceeded login rate limit."""
@@ -945,46 +1025,12 @@ def get_health_status():
     return {
         'overall': overall,
         'checks': checks,
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': utcnow().isoformat(),
         'version': APP_VERSION
     }
 
 
 # --------------- Traffic & Usage Functions (Persistent) ---------------
-
-def record_traffic_sample(total_rx, total_tx):
-    """Record a traffic sample to both memory buffer and database for persistence."""
-    global LAST_TRAFFIC_SAMPLE
-
-    now = time.time()
-
-    with TRAFFIC_BUFFER_LOCK:
-        # Calculate delta from last sample
-        if LAST_TRAFFIC_SAMPLE['time'] > 0:
-            rx_delta = max(0, total_rx - LAST_TRAFFIC_SAMPLE['rx'])
-            tx_delta = max(0, total_tx - LAST_TRAFFIC_SAMPLE['tx'])
-
-            # Add to memory buffer for fast access
-            TRAFFIC_RING_BUFFER.append({
-                'timestamp': now,
-                'rx': rx_delta,
-                'tx': tx_delta
-            })
-
-            # Persist to database (for survival across restarts)
-            if rx_delta > 0 or tx_delta > 0:
-                try:
-                    conn = get_db()
-                    conn.execute('''
-                        INSERT INTO traffic_samples (rx_delta, tx_delta)
-                        VALUES (?, ?)
-                    ''', (rx_delta, tx_delta))
-                    conn.commit()
-                    conn.close()
-                except sqlite3.Error as e:
-                    logger.warning(f"Failed to record traffic sample: {e}")
-
-        LAST_TRAFFIC_SAMPLE = {'rx': total_rx, 'tx': total_tx, 'time': now}
 
 def load_traffic_from_db():
     """Load traffic samples from database into memory buffer on startup."""
@@ -1046,36 +1092,21 @@ def get_traffic_windows():
         'last24h': {'rxBytes': rx_24h, 'txBytes': tx_24h}
     }
 
-def update_daily_client_usage(client_name, rx_delta, tx_delta, connection_seconds=0, new_session=False):
-    """Update daily usage stats for a client."""
-    today = datetime.now().strftime('%Y-%m-%d')
+def get_client_today_usage(client_name, conn=None):
+    """Get today's usage for a specific client. Uses the provided connection
+    (collector path) or opens a short-lived reader."""
+    today = utcnow().strftime('%Y-%m-%d')
+    own_conn = conn is None
     try:
-        conn = get_db()
-        conn.execute('''
-            INSERT INTO daily_client_usage (client_name, date, rx_bytes, tx_bytes, connection_seconds, session_count)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(client_name, date) DO UPDATE SET
-                rx_bytes = rx_bytes + excluded.rx_bytes,
-                tx_bytes = tx_bytes + excluded.tx_bytes,
-                connection_seconds = connection_seconds + excluded.connection_seconds,
-                session_count = session_count + excluded.session_count
-        ''', (client_name, today, rx_delta, tx_delta, connection_seconds, 1 if new_session else 0))
-        conn.commit()
-        conn.close()
-    except:
-        pass
-
-def get_client_today_usage(client_name):
-    """Get today's usage for a specific client."""
-    today = datetime.now().strftime('%Y-%m-%d')
-    try:
-        conn = get_db()
+        if own_conn:
+            conn = get_db()
         row = conn.execute('''
             SELECT rx_bytes, tx_bytes, connection_seconds, session_count
             FROM daily_client_usage
             WHERE client_name = ? AND date = ?
         ''', (client_name, today)).fetchone()
-        conn.close()
+        if own_conn:
+            conn.close()
         if row:
             return {
                 'rx_bytes': row['rx_bytes'],
@@ -1092,8 +1123,10 @@ def format_timestamp_friendly(iso_timestamp):
     if not iso_timestamp:
         return None
     try:
-        dt = datetime.fromisoformat(str(iso_timestamp).replace('Z', '+00:00'))
-        now = datetime.now()
+        dt = parse_iso_utc(iso_timestamp)
+        if dt is None:
+            return str(iso_timestamp)[:19].replace('T', ' ')
+        now = utcnow()
         diff = now - dt
 
         if diff.days == 0:
@@ -1106,11 +1139,13 @@ def format_timestamp_friendly(iso_timestamp):
                 hours = diff.seconds // 3600
                 return f"{hours}h ago"
         elif diff.days == 1:
-            return f"yesterday at {dt.strftime('%I:%M %p')}"
+            local_dt = dt.astimezone()
+            return f"yesterday at {local_dt.strftime('%I:%M %p')}"
         elif diff.days < 7:
             return f"{diff.days} days ago"
         else:
-            return dt.strftime('%b %d at %I:%M %p')
+            local_dt = dt.astimezone()
+            return local_dt.strftime('%b %d at %I:%M %p')
     except:
         return str(iso_timestamp)[:19].replace('T', ' ')
 
@@ -1118,13 +1153,15 @@ def format_timestamp_friendly(iso_timestamp):
 # --------------- Client Pause Functions ---------------
 
 def get_client_ip(client_name):
-    """Get the VPN IP address for a client."""
+    """Get the VPN IP address for a client. Prefers the collector's cached
+    inventory; falls back to wg-tool for pre-collector-start calls."""
+    for item in COLLECTOR._inventory:
+        if item['name'] == client_name:
+            return item['ip']
     output, _ = run_cmd(['wg-tool', 'list'])
-    for line in output.split('\n'):
-        if line.strip().startswith('- ') and client_name in line:
-            parts = line[2:].split('|')
-            if len(parts) >= 3 and parts[0].strip() == client_name:
-                return parts[2].strip().replace('/32', '')
+    for item in parse_inventory(output):
+        if item['name'] == client_name:
+            return item['ip']
     return None
 
 def is_client_paused(client_name):
@@ -1177,10 +1214,11 @@ def pause_client(client_name):
 
     # Record in database
     try:
-        conn = get_db()
-        conn.execute('INSERT OR REPLACE INTO paused_clients (name) VALUES (?)', (client_name,))
-        conn.commit()
-        conn.close()
+        with DB_WRITE_LOCK:
+            conn = get_db()
+            conn.execute('INSERT OR REPLACE INTO paused_clients (name) VALUES (?)', (client_name,))
+            conn.commit()
+            conn.close()
     except Exception as e:
         # Rollback iptables changes
         run_cmd(['iptables', '-D', 'FORWARD', '-s', client_ip, '-j', 'DROP'])
@@ -1189,6 +1227,7 @@ def pause_client(client_name):
 
     # Log the event
     log_connection_event(client_name, 'paused', client_ip)
+    COLLECTOR.request_refresh()
     return True, "Client paused successfully"
 
 def unpause_client(client_name):
@@ -1211,15 +1250,17 @@ def unpause_client(client_name):
 
     # Remove from database
     try:
-        conn = get_db()
-        conn.execute('DELETE FROM paused_clients WHERE name = ?', (client_name,))
-        conn.commit()
-        conn.close()
+        with DB_WRITE_LOCK:
+            conn = get_db()
+            conn.execute('DELETE FROM paused_clients WHERE name = ?', (client_name,))
+            conn.commit()
+            conn.close()
     except Exception as e:
         return False, f"Database error: {str(e)}"
 
     # Log the event
     log_connection_event(client_name, 'unpaused', client_ip)
+    COLLECTOR.request_refresh()
     return True, "Client unpaused successfully"
 
 def restore_paused_clients_iptables():
@@ -1240,330 +1281,509 @@ def restore_paused_clients_iptables():
 
 # --------------- WireGuard Functions ---------------
 
-def parse_handshake_to_seconds(hs_string):
-    """Parse handshake string like '1 minute, 30 seconds ago' to seconds."""
-    if not hs_string:
-        return None
-    
-    total = 0
-    
-    # Match patterns like "1 hour", "30 minutes", "45 seconds"
-    hour_match = re.search(r'(\d+)\s*hour', hs_string)
-    min_match = re.search(r'(\d+)\s*minute', hs_string)
-    sec_match = re.search(r'(\d+)\s*second', hs_string)
-    
-    if hour_match:
-        total += int(hour_match.group(1)) * 3600
-    if min_match:
-        total += int(min_match.group(1)) * 60
-    if sec_match:
-        total += int(sec_match.group(1))
-    
-    return total if total > 0 or sec_match else None
-
 def parse_wg_show():
-    output, _ = run_cmd(['wg', 'show', WG_INTERFACE])
+    """Parse `wg show <iface> dump` into a list of peer dicts.
+
+    Dump format gives exact byte counters and epoch handshake timestamps
+    (vs. the human-readable output v5 parsed, which was lossy: '1.5 GiB'
+    and '1 minute ago' granularity).
+
+    SECURITY: line 1 of dump output contains the interface PRIVATE key and
+    each peer line contains the preshared key. These are discarded
+    immediately and never logged, stored, or included in errors.
+    """
+    output, code = run_cmd(['wg', 'show', WG_INTERFACE, 'dump'])
     peers = []
-    current_peer = None
-    
-    for line in output.split('\n'):
-        line = line.strip()
-        if line.startswith('peer:'):
-            if current_peer:
-                peers.append(current_peer)
-            current_peer = {
-                'public_key': line.split('peer:')[1].strip(),
-                'endpoint': '',
-                'allowed_ips': '',
-                'latest_handshake': '',
-                'handshake_seconds': None,
-                'transfer_rx': 0,
-                'transfer_tx': 0,
-            }
-        elif current_peer:
-            if line.startswith('endpoint:'):
-                current_peer['endpoint'] = line.split('endpoint:')[1].strip()
-            elif line.startswith('allowed ips:'):
-                current_peer['allowed_ips'] = line.split('allowed ips:')[1].strip()
-            elif line.startswith('latest handshake:'):
-                hs = line.split('latest handshake:')[1].strip()
-                current_peer['latest_handshake'] = hs
-                current_peer['handshake_seconds'] = parse_handshake_to_seconds(hs)
-            elif line.startswith('transfer:'):
-                transfer = line.split('transfer:')[1].strip()
-                match = re.match(r'([\d.]+\s*\w+)\s+received,\s*([\d.]+\s*\w+)\s+sent', transfer)
-                if match:
-                    current_peer['transfer_rx'] = parse_bytes(match.group(1))
-                    current_peer['transfer_tx'] = parse_bytes(match.group(2))
-    
-    if current_peer:
-        peers.append(current_peer)
-    
+    if code != 0:
+        # Do NOT include output in the error path beyond a sanitized hint;
+        # dump output can contain key material.
+        logger.warning(f"wg show dump failed for {WG_INTERFACE} (rc={code})")
+        return peers
+
+    now_epoch = time.time()
+    lines = output.strip().split('\n')
+    for i, line in enumerate(lines):
+        fields = line.split('\t')
+        if i == 0:
+            # Interface line: private-key, public-key, listen-port, fwmark.
+            # Discard entirely (private key).
+            continue
+        if len(fields) < 8:
+            continue
+        # Peer line: public-key, preshared-key, endpoint, allowed-ips,
+        #            latest-handshake, transfer-rx, transfer-tx, keepalive
+        pubkey = fields[0]
+        # fields[1] is the preshared key -> discarded
+        endpoint = fields[2] if fields[2] != '(none)' else ''
+        allowed_ips = fields[3]
+        try:
+            hs_epoch = int(fields[4])
+        except ValueError:
+            hs_epoch = 0
+        try:
+            rx = int(fields[5])
+            tx = int(fields[6])
+        except ValueError:
+            rx, tx = 0, 0
+
+        if hs_epoch > 0:
+            handshake_seconds = max(0, int(now_epoch - hs_epoch))
+            handshake_fmt = format_duration(handshake_seconds) + ' ago'
+        else:
+            handshake_seconds = None
+            handshake_fmt = ''
+
+        peers.append({
+            'public_key': pubkey,
+            'endpoint': endpoint,
+            'allowed_ips': allowed_ips,
+            'latest_handshake': handshake_fmt,
+            'handshake_seconds': handshake_seconds,
+            'transfer_rx': rx,
+            'transfer_tx': tx,
+        })
+
     return peers
 
-def get_clients():
-    global BANDWIDTH_CACHE
-
-    output, _ = run_cmd(['wg-tool', 'list'])
-
-    clients = []
-    peers_live = {p['public_key']: p for p in parse_wg_show()}
-    paused_clients = get_paused_clients()  # Get all paused clients
-
-    conn = get_db()
-    now = datetime.now()
-
-    # Cleanup old bandwidth samples periodically
-    cleanup_old_samples()
-    
+def parse_inventory(output):
+    """Parse `wg-tool list` output into [{'name','public_key','ip'}]."""
+    inventory = []
     in_peers = False
     for line in output.split('\n'):
         line = line.strip()
-        # Match "Peers in <interface>.conf" (dynamic interface name)
         if '== Peers in' in line and '.conf ==' in line:
             in_peers = True
             continue
-        
         if in_peers and line.startswith('- '):
             parts = line[2:].split('|')
             if len(parts) >= 3:
-                name = parts[0].strip()
-                pubkey = parts[1].strip()
-                ip = parts[2].strip().replace('/32', '')
-                
-                live = peers_live.get(pubkey, {})
-                handshake_seconds = live.get('handshake_seconds')
-
-                # Calculate actual last_seen from WireGuard's handshake time
-                # This is the REAL time the client last communicated, not when we polled
-                if handshake_seconds is not None:
-                    actual_last_seen = (now - timedelta(seconds=handshake_seconds)).isoformat()
-                else:
-                    actual_last_seen = None
-
-                # Determine connection status (10 minute threshold)
-                is_connected = (handshake_seconds is not None and
-                               handshake_seconds < CONNECTION_THRESHOLD_SECONDS)
-                
-                # Get note
-                note_row = conn.execute('SELECT note FROM client_notes WHERE name = ?', (name,)).fetchone()
-                note = note_row['note'] if note_row else ''
-                
-                # Get/update session info
-                session_row = conn.execute('SELECT * FROM client_sessions WHERE name = ?', (name,)).fetchone()
-                
-                endpoint = live.get('endpoint', '')
-                
-                # Session continuity: only start NEW session if offline for 30+ minutes
-                SESSION_RESET_THRESHOLD = 1800  # 30 minutes
-
-                if is_connected:
-                    # Clear any pending disconnect since they're active
-                    if name in PENDING_DISCONNECTS:
-                        del PENDING_DISCONNECTS[name]
-
-                    if session_row and session_row['session_start']:
-                        # Check if we should continue existing session or start new one
-                        try:
-                            last_seen_dt = datetime.fromisoformat(session_row['last_seen']) if session_row['last_seen'] else None
-                            time_since_last_seen = (now - last_seen_dt).total_seconds() if last_seen_dt else float('inf')
-                        except:
-                            time_since_last_seen = float('inf')
-
-                        if time_since_last_seen < SESSION_RESET_THRESHOLD:
-                            # Continue existing session
-                            session_start = session_row['session_start']
-                            # Only log reconnect if they were marked offline
-                            if not session_row['is_connected']:
-                                log_connection_event(name, 'connected', endpoint)
-                        else:
-                            # Been offline too long, start fresh session
-                            session_start = now.isoformat()
-                            log_connection_event(name, 'connected', endpoint)
-                    else:
-                        # No existing session, start new one
-                        session_start = now.isoformat()
-                        log_connection_event(name, 'connected', endpoint)
-
-                    # Use actual handshake time as last_seen, not poll time
-                    conn.execute('''
-                        INSERT OR REPLACE INTO client_sessions (name, session_start, last_seen, last_endpoint, is_connected)
-                        VALUES (?, ?, ?, ?, 1)
-                    ''', (name, session_start, actual_last_seen or now.isoformat(), endpoint))
-
-                    # Calculate connection duration
-                    try:
-                        start_dt = datetime.fromisoformat(session_start)
-                        connection_duration = (now - start_dt).total_seconds()
-                    except:
-                        connection_duration = 0
-                else:
-                    # Not connected (based on handshake threshold)
-                    in_grace_period = False
-                    if session_row and session_row['is_connected']:
-                        # Check grace period before marking offline
-                        now_ts = time.time()
-                        if name not in PENDING_DISCONNECTS:
-                            # Start grace period - still show as connected
-                            PENDING_DISCONNECTS[name] = now_ts
-                            in_grace_period = True
-                        elif now_ts - PENDING_DISCONNECTS[name] >= DISCONNECT_GRACE_SECONDS:
-                            # Grace period expired, mark offline (but keep session_start!)
-                            log_connection_event(name, 'disconnected', session_row['last_endpoint'] or '')
-                            del PENDING_DISCONNECTS[name]
-                            conn.execute('''
-                                UPDATE client_sessions SET is_connected = 0 WHERE name = ?
-                            ''', (name,))
-                        else:
-                            # Still in grace period, keep showing as connected
-                            in_grace_period = True
-                    elif session_row:
-                        # Was already disconnected, but update last_seen/endpoint if we have fresh data
-                        # This handles mobile clients that change IP or have handshakes > 10 min
-                        if actual_last_seen and endpoint:
-                            conn.execute('''
-                                UPDATE client_sessions SET last_seen = ?, last_endpoint = ? WHERE name = ?
-                            ''', (actual_last_seen, endpoint, name))
-
-                    # During grace period, keep showing as connected with duration
-                    if in_grace_period and session_row and session_row['session_start']:
-                        is_connected = True  # Override for display
-                        try:
-                            start_dt = datetime.fromisoformat(session_row['session_start'])
-                            connection_duration = (now - start_dt).total_seconds()
-                        except:
-                            connection_duration = 0
-                    else:
-                        connection_duration = None
-                
-                conn.commit()
-
-                # Get last seen for offline clients - prefer actual handshake time over stored value
-                if not is_connected:
-                    # Use actual_last_seen from WireGuard if available (most accurate)
-                    if actual_last_seen:
-                        last_seen = actual_last_seen
-                        last_endpoint = endpoint if endpoint else (session_row['last_endpoint'] if session_row else None)
-                    elif session_row and session_row['last_seen']:
-                        # Fall back to stored value if no current handshake data
-                        last_seen = session_row['last_seen']
-                        last_endpoint = session_row['last_endpoint']
-                    else:
-                        last_seen = None
-                        last_endpoint = None
-                else:
-                    last_seen = None
-                    last_endpoint = None
-                
-                # Calculate bandwidth deltas
-                current_rx = live.get('transfer_rx', 0)
-                current_tx = live.get('transfer_tx', 0)
-                
-                cache_key = name
-                if cache_key in BANDWIDTH_CACHE:
-                    prev_rx, prev_tx = BANDWIDTH_CACHE[cache_key]
-                    rx_delta = max(0, current_rx - prev_rx)
-                    tx_delta = max(0, current_tx - prev_tx)
-                else:
-                    rx_delta = 0
-                    tx_delta = 0
-                
-                BANDWIDTH_CACHE[cache_key] = (current_rx, current_tx)
-                
-                # Store bandwidth sample if there's activity
-                if rx_delta > 0 or tx_delta > 0:
-                    conn.execute('''
-                        INSERT INTO bandwidth_samples (client_name, rx_delta, tx_delta)
-                        VALUES (?, ?, ?)
-                    ''', (name, rx_delta, tx_delta))
-                    conn.commit()
-                    # Update daily client usage for historical reporting
-                    update_daily_client_usage(name, rx_delta, tx_delta)
-                
-                # Get recent bandwidth samples (last 60 seconds = ~12 samples at 5s intervals)
-                bw_rows = conn.execute('''
-                    SELECT rx_delta, tx_delta FROM bandwidth_samples 
-                    WHERE client_name = ? AND timestamp > datetime('now', '-60 seconds')
-                    ORDER BY timestamp ASC
-                ''', (name,)).fetchall()
-                bandwidth_history = [{'rx': r['rx_delta'], 'tx': r['tx_delta']} for r in bw_rows]
-                
-                # GeoIP
-                geo = get_geoip(endpoint) if endpoint else None
-                if not geo and last_endpoint:
-                    geo = get_geoip(last_endpoint)
-
-                # Get today's usage for this client
-                today_usage = get_client_today_usage(name)
-
-                # Format last_seen in a friendly way
-                last_seen_friendly = format_timestamp_friendly(last_seen) if last_seen else None
-
-                clients.append({
-                    'name': name,
-                    'public_key': pubkey,
-                    'ip': ip,
-                    'connected': is_connected,
-                    'paused': name in paused_clients,
-                    'connection_duration': connection_duration,
-                    'connection_duration_fmt': format_duration(connection_duration) if connection_duration else None,
-                    'endpoint': endpoint if is_connected else '',
-                    'handshake_seconds': handshake_seconds,
-                    'handshake_fmt': live.get('latest_handshake', ''),
-                    'transfer_rx': current_rx,
-                    'transfer_tx': current_tx,
-                    'transfer_rx_fmt': format_bytes(current_rx),
-                    'transfer_tx_fmt': format_bytes(current_tx),
-                    'note': note,
-                    'last_seen': last_seen,
-                    'last_seen_friendly': last_seen_friendly,
-                    'last_endpoint': last_endpoint,
-                    'geo': geo,
-                    'bandwidth_history': bandwidth_history,
-                    'today_rx': today_usage['rx_bytes'],
-                    'today_tx': today_usage['tx_bytes'],
-                    'today_rx_fmt': format_bytes(today_usage['rx_bytes']),
-                    'today_tx_fmt': format_bytes(today_usage['tx_bytes'])
+                inventory.append({
+                    'name': parts[0].strip(),
+                    'public_key': parts[1].strip(),
+                    'ip': parts[2].strip().replace('/32', ''),
                 })
-    
-    conn.close()
-    return clients
+    return inventory
 
-def get_server_stats():
-    peers = parse_wg_show()
 
-    connected = sum(1 for p in peers
-                    if p.get('handshake_seconds') is not None
-                    and p['handshake_seconds'] < CONNECTION_THRESHOLD_SECONDS)
+class Collector:
+    """Single background thread that owns ALL WireGuard polling, session
+    state, bandwidth deltas, and database writes.
 
-    total_rx = sum(p.get('transfer_rx', 0) for p in peers)
-    total_tx = sum(p.get('transfer_tx', 0) for p in peers)
+    Design invariants (v6):
+    - External commands (wg / wg-tool) are executed and parsed BEFORE the
+      database transaction opens. No transaction is ever held across a
+      subprocess call.
+    - One BEGIN IMMEDIATE transaction per cycle; commit or rollback, never
+      partial.
+    - The published snapshot is an entirely new object graph each cycle,
+      swapped under a lock. Readers never see a mutating structure.
+    - A cycle failure keeps the last good snapshot and increments
+      consecutive_failures; readers can see staleness via metadata.
+      Repeated fatal failures exit the process so systemd restarts it.
+    """
 
-    # Record traffic sample for rolling window stats
-    record_traffic_sample(total_rx, total_tx)
+    CYCLE_SECONDS = 5
+    INVENTORY_REFRESH_CYCLES = 12      # re-run wg-tool list every ~60s
+    CLEANUP_INTERVAL_CYCLES = 120      # DB cleanups every ~10 min
+    MAX_CONSECUTIVE_FAILURES = 60      # ~5 min of failures -> exit for systemd
 
-    # Get traffic windows (1h/24h)
-    traffic_windows = get_traffic_windows()
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._snapshot = None            # {'stats':..,'clients':..}
+        self._generation = 0
+        self._wake = threading.Event()   # set by write endpoints for fast refresh
+        self._inventory = []
+        self._inventory_dirty = True
+        self._cycle_count = 0
+        self._consecutive_failures = 0
+        self._last_error = ''
+        self._last_success_ts = None
+        # Sampling state - owned exclusively by the collector thread
+        self._bandwidth_prev = {}        # name -> (rx, tx)
+        self._pending_disconnects = {}   # name -> epoch first seen disconnected
+        self._last_traffic = None        # (total_rx, total_tx)
+        self._thread = None
+        self._conn = None                # created INSIDE the collector thread
 
-    return {
-        'uptime': get_server_uptime(),
-        'wg_status': get_wg_uptime(),
-        'total_clients': len(peers),
-        'connected_clients': connected,
-        'total_rx': total_rx,
-        'total_tx': total_tx,
-        'total_rx_fmt': format_bytes(total_rx),
-        'total_tx_fmt': format_bytes(total_tx),
-        'traffic': {
-            'total': {'rxBytes': total_rx, 'txBytes': total_tx},
-            'last1h': traffic_windows['last1h'],
-            'last24h': traffic_windows['last24h'],
-            'last1h_rx_fmt': format_bytes(traffic_windows['last1h']['rxBytes']),
-            'last1h_tx_fmt': format_bytes(traffic_windows['last1h']['txBytes']),
-            'last24h_rx_fmt': format_bytes(traffic_windows['last24h']['rxBytes']),
-            'last24h_tx_fmt': format_bytes(traffic_windows['last24h']['txBytes'])
+    # ----- public API (any thread) -----
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name='collector', daemon=True)
+        self._thread.start()
+
+    def request_refresh(self):
+        """Called by write endpoints after mutations (add/revoke/pause/...)."""
+        self._inventory_dirty = True
+        self._wake.set()
+
+    def get_snapshot(self):
+        """Return (snapshot_or_None, meta). Snapshot is immutable - do not mutate."""
+        with self._lock:
+            snap = self._snapshot
+        meta = {
+            'generation': self._generation,
+            'sampled_at': self._last_success_ts.isoformat() if self._last_success_ts else None,
+            'age_seconds': round((utcnow() - self._last_success_ts).total_seconds(), 1)
+                           if self._last_success_ts else None,
+            'consecutive_failures': self._consecutive_failures,
+            'last_error': self._last_error,
         }
-    }
+        return snap, meta
+
+    # ----- collector thread internals -----
+
+    def _run(self):
+        # Long-lived writer connection is created here, inside the thread.
+        try:
+            self._conn = get_db()
+        except Exception as e:
+            logger.critical(f"Collector could not open database: {e}")
+            os._exit(3)
+
+        logger.info("Collector thread started (cycle=%ss)", self.CYCLE_SECONDS)
+        next_run = time.monotonic()
+        while True:
+            try:
+                self._cycle()
+                self._consecutive_failures = 0
+                self._last_error = ''
+            except Exception as e:
+                self._consecutive_failures += 1
+                # Sanitize: never include command output (may contain keys)
+                self._last_error = f"{type(e).__name__}: {str(e)[:120]}"
+                logger.error(f"Collector cycle failed ({self._consecutive_failures}x): {self._last_error}")
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    logger.critical("Collector failing persistently - exiting for systemd restart")
+                    os._exit(4)
+
+            self._cycle_count += 1
+
+            # Monotonic schedule with wake-up support for post-mutation refresh
+            next_run += self.CYCLE_SECONDS
+            delay = next_run - time.monotonic()
+            if delay <= 0:
+                next_run = time.monotonic()   # fell behind; reset schedule
+                delay = 0.05
+            if self._wake.wait(timeout=delay):
+                self._wake.clear()
+                next_run = time.monotonic() + self.CYCLE_SECONDS
+
+    def _refresh_inventory_if_needed(self):
+        if self._inventory_dirty or self._cycle_count % self.INVENTORY_REFRESH_CYCLES == 0:
+            output, code = run_cmd(['wg-tool', 'list'])
+            if code == 0:
+                self._inventory = parse_inventory(output)
+                self._inventory_dirty = False
+            else:
+                logger.warning(f"wg-tool list failed (rc={code}); keeping cached inventory")
+
+    def _cycle(self):
+        now = utcnow()
+        now_epoch = time.time()
+
+        # ---- Phase 1: external state capture (NO db transaction open) ----
+        self._refresh_inventory_if_needed()
+        peers_live = {p['public_key']: p for p in parse_wg_show()}
+        server_uptime = get_server_uptime()
+        wg_status = get_wg_uptime()
+
+        # ---- Phase 2: pure reads ----
+        paused_clients = get_paused_clients()
+
+        # ---- Phase 3: state machine + single write transaction ----
+        conn = self._conn
+        clients_out = []
+        writes = []   # deferred (sql, params) executed inside the transaction
+
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            for item in self._inventory:
+                client = self._process_client(conn, writes, item, peers_live,
+                                              paused_clients, now, now_epoch)
+                clients_out.append(client)
+
+            # Orphan peers: live peers with no matching config entry
+            known_keys = {i['public_key'] for i in self._inventory}
+            for pubkey, live in peers_live.items():
+                if pubkey not in known_keys:
+                    clients_out.append(self._orphan_client(live, pubkey))
+
+            # Server totals + traffic sample
+            total_rx = sum(p.get('transfer_rx', 0) for p in peers_live.values())
+            total_tx = sum(p.get('transfer_tx', 0) for p in peers_live.values())
+            self._record_traffic(writes, total_rx, total_tx, now_epoch)
+
+            for sql, params in writes:
+                conn.execute(sql, params)
+
+            # Periodic cleanups inside the same transaction, off the hot path
+            if self._cycle_count % self.CLEANUP_INTERVAL_CYCLES == 0:
+                conn.execute("DELETE FROM bandwidth_samples WHERE timestamp < datetime('now', '-2 minutes')")
+                conn.execute("DELETE FROM traffic_samples WHERE timestamp < datetime('now', '-24 hours')")
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        # ---- Phase 4: assemble + publish snapshot (new object, atomic swap) ----
+        connected = sum(1 for c in clients_out if c['connected'] and not c.get('orphan'))
+        traffic_windows = get_traffic_windows()
+        total_rx = sum(p.get('transfer_rx', 0) for p in peers_live.values())
+        total_tx = sum(p.get('transfer_tx', 0) for p in peers_live.values())
+
+        stats = {
+            'uptime': server_uptime,
+            'wg_status': wg_status,
+            'total_clients': len(clients_out),
+            'connected_clients': connected,
+            'total_rx': total_rx,
+            'total_tx': total_tx,
+            'total_rx_fmt': format_bytes(total_rx),
+            'total_tx_fmt': format_bytes(total_tx),
+            'traffic': {
+                'total': {'rxBytes': total_rx, 'txBytes': total_tx},
+                'last1h': traffic_windows['last1h'],
+                'last24h': traffic_windows['last24h'],
+                'last1h_rx_fmt': format_bytes(traffic_windows['last1h']['rxBytes']),
+                'last1h_tx_fmt': format_bytes(traffic_windows['last1h']['txBytes']),
+                'last24h_rx_fmt': format_bytes(traffic_windows['last24h']['rxBytes']),
+                'last24h_tx_fmt': format_bytes(traffic_windows['last24h']['txBytes'])
+            }
+        }
+
+        snapshot = {'stats': stats, 'clients': clients_out}
+        with self._lock:
+            self._snapshot = snapshot
+            self._generation += 1
+            self._last_success_ts = now
+
+    def _orphan_client(self, live, pubkey):
+        hs = live.get('handshake_seconds')
+        is_connected = hs is not None and hs < CONNECTION_THRESHOLD_SECONDS
+        return {
+            'name': '(no-name)', 'public_key': pubkey,
+            'ip': live.get('allowed_ips', ''), 'connected': is_connected,
+            'paused': False, 'orphan': True,
+            'connection_duration': None, 'connection_duration_fmt': None,
+            'endpoint': live.get('endpoint', '') if is_connected else '',
+            'handshake_seconds': hs, 'handshake_fmt': live.get('latest_handshake', ''),
+            'transfer_rx': live.get('transfer_rx', 0), 'transfer_tx': live.get('transfer_tx', 0),
+            'transfer_rx_fmt': format_bytes(live.get('transfer_rx', 0)),
+            'transfer_tx_fmt': format_bytes(live.get('transfer_tx', 0)),
+            'note': '', 'last_seen': None, 'last_seen_friendly': None,
+            'last_endpoint': None, 'geo': None, 'bandwidth_history': [],
+            'today_rx': 0, 'today_tx': 0,
+            'today_rx_fmt': format_bytes(0), 'today_tx_fmt': format_bytes(0),
+        }
+
+    def _process_client(self, conn, writes, item, peers_live, paused_clients, now, now_epoch):
+        name, pubkey, ip = item['name'], item['public_key'], item['ip']
+        live = peers_live.get(pubkey, {})
+        handshake_seconds = live.get('handshake_seconds')
+
+        # Actual last communication time derived from WireGuard's handshake
+        if handshake_seconds is not None:
+            actual_last_seen = (now - timedelta(seconds=handshake_seconds)).isoformat()
+        else:
+            actual_last_seen = None
+
+        # NOTE: WireGuard is connectionless - this is an "active recently"
+        # heuristic (handshake within threshold), not a live connection.
+        is_connected = (handshake_seconds is not None and
+                        handshake_seconds < CONNECTION_THRESHOLD_SECONDS)
+
+        note_row = conn.execute('SELECT note FROM client_notes WHERE name = ?', (name,)).fetchone()
+        note = note_row['note'] if note_row else ''
+
+        session_row = conn.execute('SELECT * FROM client_sessions WHERE name = ?', (name,)).fetchone()
+        endpoint = live.get('endpoint', '')
+        connection_duration = None
+
+        if is_connected:
+            self._pending_disconnects.pop(name, None)
+
+            if session_row and session_row['session_start']:
+                last_seen_dt = parse_iso_utc(session_row['last_seen'])
+                time_since_last_seen = ((now - last_seen_dt).total_seconds()
+                                        if last_seen_dt else float('inf'))
+                if time_since_last_seen < SESSION_RESET_THRESHOLD:
+                    session_start = session_row['session_start']
+                    if not session_row['is_connected']:
+                        writes.append(("INSERT INTO connection_history (client_name, event_type, endpoint) VALUES (?, ?, ?)",
+                                       (name, 'connected', endpoint)))
+                else:
+                    session_start = now.isoformat()
+                    writes.append(("INSERT INTO connection_history (client_name, event_type, endpoint) VALUES (?, ?, ?)",
+                                   (name, 'connected', endpoint)))
+            else:
+                session_start = now.isoformat()
+                writes.append(("INSERT INTO connection_history (client_name, event_type, endpoint) VALUES (?, ?, ?)",
+                               (name, 'connected', endpoint)))
+
+            writes.append(("INSERT OR REPLACE INTO client_sessions (name, session_start, last_seen, last_endpoint, is_connected) VALUES (?, ?, ?, ?, 1)",
+                           (name, session_start, actual_last_seen or now.isoformat(), endpoint)))
+
+            start_dt = parse_iso_utc(session_start)
+            connection_duration = (now - start_dt).total_seconds() if start_dt else 0
+        else:
+            in_grace_period = False
+            if session_row and session_row['is_connected']:
+                if name not in self._pending_disconnects:
+                    self._pending_disconnects[name] = now_epoch
+                    in_grace_period = True
+                elif now_epoch - self._pending_disconnects[name] >= DISCONNECT_GRACE_SECONDS:
+                    writes.append(("INSERT INTO connection_history (client_name, event_type, endpoint) VALUES (?, ?, ?)",
+                                   (name, 'disconnected', session_row['last_endpoint'] or '')))
+                    del self._pending_disconnects[name]
+                    writes.append(("UPDATE client_sessions SET is_connected = 0 WHERE name = ?", (name,)))
+                else:
+                    in_grace_period = True
+            elif session_row:
+                # Already disconnected; refresh last_seen/endpoint from live data
+                if actual_last_seen and endpoint:
+                    writes.append(("UPDATE client_sessions SET last_seen = ?, last_endpoint = ? WHERE name = ?",
+                                   (actual_last_seen, endpoint, name)))
+
+            if in_grace_period and session_row and session_row['session_start']:
+                is_connected = True  # display override during grace period
+                start_dt = parse_iso_utc(session_row['session_start'])
+                connection_duration = (now - start_dt).total_seconds() if start_dt else 0
+
+        # Last seen for offline clients
+        if not is_connected:
+            if actual_last_seen:
+                last_seen = actual_last_seen
+                last_endpoint = endpoint if endpoint else (session_row['last_endpoint'] if session_row else None)
+            elif session_row and session_row['last_seen']:
+                last_seen = session_row['last_seen']
+                last_endpoint = session_row['last_endpoint']
+            else:
+                last_seen, last_endpoint = None, None
+        else:
+            last_seen, last_endpoint = None, None
+
+        # Bandwidth deltas (counter-reset aware: interface restart zeroes
+        # counters; if current < previous, delta = current)
+        current_rx = live.get('transfer_rx', 0)
+        current_tx = live.get('transfer_tx', 0)
+        prev = self._bandwidth_prev.get(name)
+        if prev is not None:
+            prev_rx, prev_tx = prev
+            rx_delta = current_rx - prev_rx if current_rx >= prev_rx else current_rx
+            tx_delta = current_tx - prev_tx if current_tx >= prev_tx else current_tx
+        else:
+            rx_delta, tx_delta = 0, 0
+        self._bandwidth_prev[name] = (current_rx, current_tx)
+
+        if rx_delta > 0 or tx_delta > 0:
+            writes.append(("INSERT INTO bandwidth_samples (client_name, rx_delta, tx_delta) VALUES (?, ?, ?)",
+                           (name, rx_delta, tx_delta)))
+            today = now.strftime('%Y-%m-%d')
+            writes.append((
+                "INSERT INTO daily_client_usage (client_name, date, rx_bytes, tx_bytes, connection_seconds, session_count) "
+                "VALUES (?, ?, ?, ?, 0, 0) "
+                "ON CONFLICT(client_name, date) DO UPDATE SET "
+                "rx_bytes = rx_bytes + excluded.rx_bytes, "
+                "tx_bytes = tx_bytes + excluded.tx_bytes",
+                (name, today, rx_delta, tx_delta)))
+
+        bw_rows = conn.execute(
+            "SELECT rx_delta, tx_delta FROM bandwidth_samples "
+            "WHERE client_name = ? AND timestamp > datetime('now', '-60 seconds') "
+            "ORDER BY timestamp ASC", (name,)).fetchall()
+        bandwidth_history = [{'rx': r['rx_delta'], 'tx': r['tx_delta']} for r in bw_rows]
+
+        geo = get_geoip(endpoint) if endpoint else None
+        if not geo and last_endpoint:
+            geo = get_geoip(last_endpoint)
+
+        today_usage = get_client_today_usage(name, conn=conn)
+        last_seen_friendly = format_timestamp_friendly(last_seen) if last_seen else None
+
+        return {
+            'name': name,
+            'public_key': pubkey,
+            'ip': ip,
+            'connected': is_connected,
+            'paused': name in paused_clients,
+            'connection_duration': connection_duration,
+            'connection_duration_fmt': format_duration(connection_duration) if connection_duration else None,
+            'endpoint': endpoint if is_connected else '',
+            'handshake_seconds': handshake_seconds,
+            'handshake_fmt': live.get('latest_handshake', ''),
+            'transfer_rx': current_rx,
+            'transfer_tx': current_tx,
+            'transfer_rx_fmt': format_bytes(current_rx),
+            'transfer_tx_fmt': format_bytes(current_tx),
+            'note': note,
+            'last_seen': last_seen,
+            'last_seen_friendly': last_seen_friendly,
+            'last_endpoint': last_endpoint,
+            'geo': geo,
+            'bandwidth_history': bandwidth_history,
+            'today_rx': today_usage['rx_bytes'],
+            'today_tx': today_usage['tx_bytes'],
+            'today_rx_fmt': format_bytes(today_usage['rx_bytes']),
+            'today_tx_fmt': format_bytes(today_usage['tx_bytes'])
+        }
+
+    def _record_traffic(self, writes, total_rx, total_tx, now_epoch):
+        """Server-wide traffic deltas -> ring buffer + persisted sample.
+
+        Counter-reset aware. Deltas are attributed to the 5s cycle in which
+        they were observed (continuous sampling - no more attributing hours
+        of traffic to the moment a browser opens).
+        """
+        if self._last_traffic is not None:
+            prev_rx, prev_tx = self._last_traffic
+            rx_delta = total_rx - prev_rx if total_rx >= prev_rx else total_rx
+            tx_delta = total_tx - prev_tx if total_tx >= prev_tx else total_tx
+            with TRAFFIC_BUFFER_LOCK:
+                TRAFFIC_RING_BUFFER.append({'timestamp': now_epoch, 'rx': rx_delta, 'tx': tx_delta})
+            if rx_delta > 0 or tx_delta > 0:
+                writes.append(("INSERT INTO traffic_samples (rx_delta, tx_delta) VALUES (?, ?)",
+                               (rx_delta, tx_delta)))
+        self._last_traffic = (total_rx, total_tx)
+
+
+COLLECTOR = Collector()
+
+
+class HealthMonitor:
+    """Separate thread for health checks so slow checks (DNS: up to 5s each)
+    never stall the 5-second status collector."""
+
+    INTERVAL_SECONDS = 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._status = None
+
+    def start(self):
+        threading.Thread(target=self._run, name='health', daemon=True).start()
+
+    def get(self):
+        with self._lock:
+            return self._status
+
+    def _run(self):
+        while True:
+            try:
+                status = get_health_status()
+                with self._lock:
+                    self._status = status
+            except Exception as e:
+                logger.warning(f"Health check cycle failed: {e}")
+            time.sleep(self.INTERVAL_SECONDS)
+
+
+HEALTH = HealthMonitor()
+
 
 def get_connection_history(client_name=None, limit=50):
     conn = get_db()
@@ -1582,13 +1802,21 @@ def get_connection_history(client_name=None, limit=50):
     return [dict(r) for r in rows]
 
 def log_connection_event(client_name, event_type, endpoint=''):
-    conn = get_db()
-    conn.execute('''
-        INSERT INTO connection_history (client_name, event_type, endpoint)
-        VALUES (?, ?, ?)
-    ''', (client_name, event_type, endpoint))
-    conn.commit()
-    conn.close()
+    """Request-context event logging (collector logs events inside its own
+    transaction). Serialized behind the process-wide write lock."""
+    with DB_WRITE_LOCK:
+        conn = get_db()
+        try:
+            conn.execute('''
+                INSERT INTO connection_history (client_name, event_type, endpoint)
+                VALUES (?, ?, ?)
+            ''', (client_name, event_type, endpoint))
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            logger.warning(f"Failed to log connection event: {e}")
+        finally:
+            conn.close()
 
 def add_client(name):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
@@ -1599,6 +1827,7 @@ def add_client(name):
     output, code = run_cmd(['wg-tool', 'add', name])
     if code == 0:
         log_connection_event(name, 'created')
+        COLLECTOR.request_refresh()
     return code == 0, output
 
 def revoke_client(name, pubkey=None):
@@ -1608,12 +1837,16 @@ def revoke_client(name, pubkey=None):
         output, code = run_cmd(['wg-tool', 'revoke', name])
         if code == 0:
             log_connection_event(name, 'revoked')
-            conn = get_db()
-            conn.execute('DELETE FROM client_notes WHERE name = ?', (name,))
-            conn.execute('DELETE FROM client_sessions WHERE name = ?', (name,))
-            conn.execute('DELETE FROM bandwidth_samples WHERE client_name = ?', (name,))
-            conn.commit()
-            conn.close()
+            with DB_WRITE_LOCK:
+                conn = get_db()
+                try:
+                    conn.execute('DELETE FROM client_notes WHERE name = ?', (name,))
+                    conn.execute('DELETE FROM client_sessions WHERE name = ?', (name,))
+                    conn.execute('DELETE FROM bandwidth_samples WHERE client_name = ?', (name,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            COLLECTOR.request_refresh()
         return code == 0, output
 
     # For orphaned peers (like "(no-name)"), use public key to revoke
@@ -1668,13 +1901,17 @@ def get_client_qr(name):
 def update_client_note(name, note):
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return False
-    conn = get_db()
-    conn.execute('''
-        INSERT OR REPLACE INTO client_notes (name, note, updated_at)
-        VALUES (?, ?, datetime('now'))
-    ''', (name, note[:500]))
-    conn.commit()
-    conn.close()
+    with DB_WRITE_LOCK:
+        conn = get_db()
+        try:
+            conn.execute('''
+                INSERT OR REPLACE INTO client_notes (name, note, updated_at)
+                VALUES (?, ?, datetime('now'))
+            ''', (name, note[:500]))
+            conn.commit()
+        finally:
+            conn.close()
+    COLLECTOR.request_refresh()
     return True
 
 
@@ -2709,6 +2946,8 @@ TEMPLATE = '''
                 <div class="health-details" id="healthDetails"></div>
             </div>
 
+            <div id="staleBanner" style="display:none; background:rgba(255,170,0,0.15); border:1px solid rgba(255,170,0,0.5); color:#ffaa00; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:13px;"></div>
+
             <div class="stats-grid" id="stats-grid">
                 <div class="stat-box"><div class="number">—</div><div class="label">Loading...</div></div>
             </div>
@@ -3057,6 +3296,13 @@ TEMPLATE = '''
                                 showSessionExpiredError();
                             }
                             throw new Error('Session expired');
+                        }
+                        // 503 during startup: collector has not produced its
+                        // first snapshot yet. Benign - retry on next poll.
+                        if (response.status === 503) {
+                            const err = new Error('Server starting up');
+                            err.isStarting = true;
+                            throw err;
                         }
                         // Check for other HTTP errors
                         if (!response.ok) {
@@ -4297,6 +4543,20 @@ TEMPLATE = '''
                         currentStats = data.stats;
                         allClients = data.clients || [];
 
+                        // Stale-data indicator: collector metadata reports
+                        // snapshot age; warn if collection has stalled
+                        const meta = data.meta || {};
+                        const staleEl = document.getElementById('staleBanner');
+                        if (staleEl) {
+                            if (meta.age_seconds != null && meta.age_seconds > 60) {
+                                staleEl.textContent = `Data is ${Math.round(meta.age_seconds)}s old` +
+                                    (meta.last_error ? ` - collector error: ${meta.last_error}` : '');
+                                staleEl.style.display = 'block';
+                            } else {
+                                staleEl.style.display = 'none';
+                            }
+                        }
+
                         // Update stats
                         updateStatsDisplay();
 
@@ -4318,6 +4578,11 @@ TEMPLATE = '''
                         // Ignore aborted requests (we cancelled them intentionally)
                         if (err.name === 'AbortError') return;
                         if (err.message === 'Session expired') return;  // Already handled by apiFetch
+                        if (err.isStarting) {
+                            // Service just (re)started; first snapshot arrives within ~5s
+                            console.info('Collector starting, retrying...');
+                            return;
+                        }
 
                         // Increment error count for backoff
                         consecutiveErrors = Math.min(consecutiveErrors + 1, MAX_BACKOFF_MULTIPLIER);
@@ -4721,7 +4986,11 @@ def login():
             flash('Too many login attempts. Please wait 5 minutes.')
             return redirect(url_for('index'))
 
-        if request.form.get('username') == AUTH_USER and check_password(request.form.get('password', '')):
+        password = request.form.get('password', '')
+        ok, needs_migration = check_password(password)
+        if request.form.get('username') == AUTH_USER and ok:
+            if needs_migration:
+                migrate_legacy_credential(password)
             session.permanent = True
             session['logged_in'] = True
             clear_login_attempts(client_ip)
@@ -4741,9 +5010,16 @@ def logout():
 @app.route('/api/status')
 @login_required
 def api_status():
+    """Read-only: serves the collector's latest snapshot. Zero side effects,
+    zero subprocesses, zero DB writes - N viewers cost nothing."""
+    snapshot, meta = COLLECTOR.get_snapshot()
+    if snapshot is None:
+        # Collector has not produced its first sample yet (service just started)
+        return jsonify({'starting': True, 'meta': meta}), 503
     return jsonify({
-        'stats': get_server_stats(),
-        'clients': get_clients()
+        'stats': snapshot['stats'],
+        'clients': snapshot['clients'],
+        'meta': meta
     })
 
 @app.route('/api/history')
@@ -4754,7 +5030,11 @@ def api_history():
 @app.route('/api/health')
 @login_required
 def api_health():
-    return jsonify(get_health_status())
+    """Read-only: serves the health monitor's cached status."""
+    status = HEALTH.get()
+    if status is None:
+        return jsonify({'starting': True}), 503
+    return jsonify(status)
 
 @app.route('/api/note', methods=['POST'])
 @login_required
@@ -4810,7 +5090,7 @@ def api_change_password():
         return jsonify({'error': 'New password must be at least 6 characters'}), 400
 
     # Verify current password
-    if not check_password(current_password):
+    if not check_password(current_password)[0]:
         return jsonify({'error': 'Current password is incorrect'}), 403
 
     # Update password
@@ -4845,7 +5125,7 @@ def api_change_username():
         return jsonify({'error': 'Username can only contain letters, numbers, hyphens, and underscores'}), 400
 
     # Verify current password
-    if not check_password(current_password):
+    if not check_password(current_password)[0]:
         return jsonify({'error': 'Current password is incorrect'}), 403
 
     # Update username
@@ -5141,11 +5421,12 @@ def api_auto_update():
         data = request.get_json()
         enabled = data.get('enabled', False) if data else False
 
-        conn.execute(
-            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('auto_update_enabled', ?, datetime('now'))",
-            ('1' if enabled else '0',)
-        )
-        conn.commit()
+        with DB_WRITE_LOCK:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('auto_update_enabled', ?, datetime('now'))",
+                ('1' if enabled else '0',)
+            )
+            conn.commit()
         conn.close()
 
         # Update cron job
@@ -5222,8 +5503,12 @@ def download_config(name):
 
 # --------------- Main ---------------
 
-if __name__ == '__main__':
-    import sys
+def main():
+    """Explicit initialization order, then serve with waitress.
+
+    Entry point remains `python app.py [port]` so systemd units are simple
+    and init cannot be bypassed (as it could with `waitress-serve app:app`).
+    """
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
 
@@ -5239,16 +5524,15 @@ if __name__ == '__main__':
     # Load persistent traffic stats from database
     load_traffic_from_db()
     cleanup_old_traffic_samples()
-    print(f"Loaded {len(TRAFFIC_RING_BUFFER)} traffic samples from database")
+    logger.info(f"Loaded {len(TRAFFIC_RING_BUFFER)} traffic samples from database")
 
     # Restore iptables rules for paused clients
     restored = restore_paused_clients_iptables()
     if restored > 0:
-        print(f"Restored iptables rules for {restored} paused client(s)")
+        logger.info(f"Restored iptables rules for {restored} paused client(s)")
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
 
-    # Format interface source for display
     interface_source_display = {
         'env': 'from environment variable',
         'auto-single': 'auto-detected',
@@ -5256,21 +5540,47 @@ if __name__ == '__main__':
         'fallback': 'fallback, no interfaces found'
     }.get(WG_INTERFACE_SOURCE, 'unknown')
 
-    # Format credential source for display
     credential_source_display = {
         'env': 'Using password from environment variable',
         'database': 'Using password from database',
         'default': 'No password configured'
     }.get(CREDENTIAL_SOURCE, 'unknown')
 
-    # Comprehensive startup log
-    print(f"\nLeathGuard v{APP_VERSION} starting...")
-    print(f"\nWireGuard configuration:")
-    print(f"  Interface: {WG_INTERFACE} ({interface_source_display})")
-    print(f"  Config: {WG_CONF_PATH}")
-    print(f"  Clients dir: {WG_CLIENTS_DIR}")
-    print(f"  Subnet: {VPN_SUBNET}")
-    print(f"  Server pubkey: {SERVER_PUBKEY[:20]}..." if SERVER_PUBKEY else "  Server pubkey: (not available)")
-    print(f"  Credentials: {credential_source_display}")
-    print(f"\nLeathGuard v{APP_VERSION} running on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    logger.info(f"LeathGuard v{APP_VERSION} starting...")
+    logger.info(f"  Interface: {WG_INTERFACE} ({interface_source_display})")
+    logger.info(f"  Config: {WG_CONF_PATH}")
+    logger.info(f"  Clients dir: {WG_CLIENTS_DIR}")
+    logger.info(f"  Subnet: {VPN_SUBNET}")
+    if SERVER_PUBKEY:
+        logger.info(f"  Server pubkey: {SERVER_PUBKEY[:20]}...")
+    logger.info(f"  Credentials: {credential_source_display}")
+
+    # Start background workers AFTER init so they see final config
+    COLLECTOR.start()
+    HEALTH.start()
+
+    logger.info(f"LeathGuard v{APP_VERSION} serving on {BIND_HOST}:{port} "
+                f"(waitress, {WAITRESS_THREADS} threads)")
+    if BIND_HOST not in ('127.0.0.1', 'localhost', '::1'):
+        logger.warning("Panel is bound to a non-loopback address. If you are "
+                       "fronting it with a reverse proxy or Cloudflare Tunnel, "
+                       "set WG_PANEL_BIND=127.0.0.1 so access controls cannot "
+                       "be bypassed via the raw port.")
+
+    from waitress import serve
+    serve(
+        app,
+        host=BIND_HOST,
+        port=port,
+        threads=WAITRESS_THREADS,
+        connection_limit=200,
+        channel_timeout=60,
+        cleanup_interval=30,
+        # Panel requests are small (JSON/forms); cap request bodies at 1 MiB
+        max_request_body_size=1048576,
+        ident='LeathGuard',
+    )
+
+
+if __name__ == '__main__':
+    main()

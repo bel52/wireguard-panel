@@ -2,7 +2,7 @@
 set -euo pipefail
 
 #
-# LeathGuard Installer
+# LeathGuard Installer (v6)
 # Installs both wg-tool (CLI) and wg-panel (Web UI)
 #
 
@@ -39,9 +39,17 @@ while true; do
     fi
     echo "Password cannot be empty."
 done
+echo
 
-# Generate password hash
-PASS_HASH=$(echo -n "$WG_PASS" | sha256sum | cut -d' ' -f1)
+# Bind address: default to loopback for reverse-proxy / tunnel deployments.
+# Exposing directly on all interfaces is opt-in.
+echo "🌐 Network Exposure"
+echo "─────────────────────────────────"
+echo "If you front LeathGuard with a reverse proxy or Cloudflare Tunnel"
+echo "(recommended), keep the default loopback bind so the raw port cannot"
+echo "bypass your access controls."
+read -p "Bind address [127.0.0.1] (enter 0.0.0.0 to expose directly): " BIND_HOST
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
 echo
 
 # Install dependencies
@@ -72,7 +80,14 @@ fi
 echo "[5/8] Creating Python environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$INSTALL_DIR/venv/bin/pip" install --quiet flask
+"$INSTALL_DIR/venv/bin/pip" install --quiet flask waitress
+
+# Generate PBKDF2 password hash (v6: no more unsalted SHA256)
+PASS_HASH=$(WG_INSTALL_PASS="$WG_PASS" "$INSTALL_DIR/venv/bin/python3" -c "
+import os
+from werkzeug.security import generate_password_hash
+print(generate_password_hash(os.environ['WG_INSTALL_PASS'], method='pbkdf2:sha256:600000'))
+")
 
 # Initialize database
 touch "$INSTALL_DIR/wg-panel.db"
@@ -110,6 +125,7 @@ WorkingDirectory=$INSTALL_DIR
 Environment="WG_PANEL_USER=$WG_USER"
 Environment="WG_PANEL_PASS_HASH=$PASS_HASH"
 Environment="WG_PANEL_DB=$INSTALL_DIR/wg-panel.db"
+Environment="WG_PANEL_BIND=$BIND_HOST"
 # WG_INTERFACE is auto-detected. Uncomment below to override for multi-interface setups:
 # Environment="WG_INTERFACE=wg1"
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/app.py $PORT
@@ -124,9 +140,11 @@ systemctl daemon-reload
 systemctl enable wg-panel >/dev/null 2>&1
 systemctl restart wg-panel
 
-# Firewall
+# Firewall - only open the port when directly exposed
 echo "[7/8] Configuring firewall..."
-if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+if [[ "$BIND_HOST" == "127.0.0.1" || "$BIND_HOST" == "localhost" || "$BIND_HOST" == "::1" ]]; then
+    echo "    Loopback bind - no firewall port opened (reverse proxy/tunnel handles access)"
+elif command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow "$PORT/tcp" >/dev/null 2>&1
     echo "    UFW: Opened port $PORT/tcp"
 else
@@ -148,7 +166,7 @@ if ! grep -q "alias wgdeploy=" /root/.bashrc 2>/dev/null; then
 fi
 
 # Add to invoking user's bashrc if running via sudo
-if [[ -n "$SUDO_USER" && "$SUDO_USER" != "root" ]]; then
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     USER_HOME=$(eval echo "~$SUDO_USER")
     USER_BASHRC="$USER_HOME/.bashrc"
     if [[ -f "$USER_BASHRC" ]] && ! grep -q "alias wgdeploy=" "$USER_BASHRC" 2>/dev/null; then
@@ -161,8 +179,12 @@ if [[ -n "$SUDO_USER" && "$SUDO_USER" != "root" ]]; then
     fi
 fi
 
-# Get server IP
-SERVER_IP=$(curl -sS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+# Determine display address
+if [[ "$BIND_HOST" == "127.0.0.1" || "$BIND_HOST" == "localhost" ]]; then
+    DISPLAY_ADDR="127.0.0.1 (via your reverse proxy/tunnel)"
+else
+    DISPLAY_ADDR=$(curl -sS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+fi
 
 echo
 echo "╔═══════════════════════════════════════════════════════════╗"
@@ -172,13 +194,13 @@ echo
 VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "?")
 echo "LeathGuard v$VERSION is now running"
 echo
-echo "Web Panel:  http://$SERVER_IP:$PORT"
+echo "Web Panel:  http://$DISPLAY_ADDR:$PORT"
 echo "Username:   $WG_USER"
 echo "Password:   (as entered)"
 echo
 echo "Quick commands:"
 echo "   leathguard status                 # Check installation status"
-echo "   leathguard update                 # Update to latest version"
+echo "   leathguard update                 # Update to latest release"
 echo "   leathguard logs -f                # Follow service logs"
 echo "   sudo wg-tool --help               # Manage WireGuard clients"
 echo
@@ -186,7 +208,4 @@ echo "Service management:"
 echo "   sudo systemctl status wg-panel    # Check status"
 echo "   sudo journalctl -u wg-panel -f    # View logs"
 echo "   sudo systemctl restart wg-panel   # Restart"
-echo
-echo "Note: Open port $PORT in your cloud firewall if needed."
-echo "(Restart your shell or run 'source ~/.bashrc' to use wgdeploy)"
 echo

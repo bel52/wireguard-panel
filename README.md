@@ -12,7 +12,28 @@ A modern, self-hosted WireGuard VPN management panel with a beautiful dark-theme
 - **Automatic Updates** - In-app update notifications with one-click updates
 - **Auto-Update Option** - Optional automatic updates via cron (3 AM daily)
 - **Global CLI** - `leathguard` command works from anywhere
-- **Secure by Default** - Session-based auth, CSRF protection, password hashing
+- **Secure by Default** - Session-based auth, CSRF protection, PBKDF2 password hashing
+
+## v6 Architecture
+
+v6.0.0 rebuilt the data path for stability:
+
+- A single **background collector thread** owns all WireGuard polling,
+  session/bandwidth state, and database writes (one transaction per 5s cycle).
+  Data collection runs continuously, whether or not a browser is open.
+- **API endpoints are read-only** - they serve an in-memory snapshot, so any
+  number of concurrent viewers cannot distort stats or corrupt state.
+- **SQLite in WAL mode** with a single writer and non-blocking readers.
+- Served by **waitress** (production WSGI, bounded worker pool) instead of the
+  Flask development server.
+- Default bind is **127.0.0.1** for reverse-proxy/Cloudflare Tunnel
+  deployments; set `WG_PANEL_BIND=0.0.0.0` (or answer the installer prompt)
+  to expose directly.
+- Updates deploy **pinned release tags** with automatic backup and rollback.
+
+Note on "Connected": WireGuard is connectionless. The dashboard shows a client
+as connected when its last handshake is within 10 minutes - an
+"active recently" heuristic, not a live circuit.
 
 ## Quick Start
 
@@ -224,7 +245,7 @@ This will:
 sudo journalctl -u wg-panel -n 50 --no-pager
 
 # Common issues:
-# - Missing venv: sudo python3 -m venv /opt/wg-panel/venv && sudo /opt/wg-panel/venv/bin/pip install flask
+# - Missing venv: sudo python3 -m venv /opt/wg-panel/venv && sudo /opt/wg-panel/venv/bin/pip install flask waitress
 # - Wrong permissions: sudo chown -R root:root /opt/wg-panel
 # - Port in use: Check if another service is using port 5000
 ```
