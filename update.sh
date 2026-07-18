@@ -225,7 +225,13 @@ if [[ -x "$VENV_PY" ]]; then
         head -1 "$w" | grep -q '^#!' && sed -i "1s|^#!.*|#!$VENV_PY|" "$w" 2>/dev/null || true
     done
 fi
-"$VENV_PY" -m pip install --quiet --upgrade flask waitress
+if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
+    "$VENV_PY" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
+else
+    "$VENV_PY" -m pip install --quiet --upgrade flask waitress
+fi
+# geoip2 is a soft dependency (local GeoLite2 lookups); never fail the update on it
+"$VENV_PY" -m pip install --quiet geoip2 2>/dev/null || echo "  (note: geoip2 lib not installed; GeoIP will use API fallback)"
 
 if ! "$INSTALL_DIR/venv/bin/python3" -c "
 import importlib.util, sys
@@ -259,6 +265,24 @@ echo "  Files installed"
 # ---------------------------------------------------------------
 # Step 6: Detect service + port
 # ---------------------------------------------------------------
+# GeoIP auto-provisioning: if MaxMind creds are in the contract and the DB is
+# missing or stale (>8 days), refresh it. Non-fatal; the panel runs on API
+# fallback regardless.
+if [[ -n "${WG_PANEL_GEOIP_ACCOUNT:-}" && -n "${WG_PANEL_GEOIP_KEY:-}" ]]; then
+    DB_LINK="$INSTALL_DIR/GeoLite2-City.mmdb"
+    NEED_GEOIP=false
+    if [[ ! -f "$DB_LINK" ]]; then
+        NEED_GEOIP=true
+    else
+        # stale check: older than 8 days
+        if [[ -n "$(find "$DB_LINK" -mtime +8 2>/dev/null)" ]]; then NEED_GEOIP=true; fi
+    fi
+    if [[ "$NEED_GEOIP" == "true" ]] && command -v leathguard >/dev/null 2>&1; then
+        echo "  GeoIP: provisioning/refreshing GeoLite2 database..."
+        leathguard geoip-setup >/dev/null 2>&1 && echo "  GeoIP: database ready" || echo "  GeoIP: provisioning skipped/failed (API fallback active)"
+    fi
+fi
+
 echo "[6/8] Detecting service..."
 if [[ -n "${SERVICE_NAME:-}" && -n "${PANEL_PORT:-}" ]]; then
     echo "  Service (from contract): $SERVICE_NAME (port $PANEL_PORT)"

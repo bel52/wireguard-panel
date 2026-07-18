@@ -82,7 +82,11 @@ fi
 echo "[5/8] Creating Python environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
-"$INSTALL_DIR/venv/bin/python" -m pip install --quiet flask waitress
+if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
+    "$INSTALL_DIR/venv/bin/python" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
+else
+    "$INSTALL_DIR/venv/bin/python" -m pip install --quiet flask waitress geoip2
+fi
 
 # Generate PBKDF2 password hash (v6: no more unsalted SHA256)
 PASS_HASH=$(WG_INSTALL_PASS="$WG_PASS" "$INSTALL_DIR/venv/bin/python3" -c "
@@ -173,6 +177,23 @@ chmod 600 /etc/leathguard/env.conf
 echo "    Environment contract written: /etc/leathguard/env.conf"
 
 # Setup update alias
+# Reduce journald noise: the collector runs `sudo wg show` every few seconds,
+# and PAM logs a session open/close each time. Silence syslog for the specific
+# read-only commands the panel needs (does NOT widen privileges).
+if [[ -d /etc/sudoers.d ]]; then
+    cat > /etc/sudoers.d/wg-panel-quiet <<'SUDOEOF'
+Defaults!/usr/bin/wg !syslog
+Defaults!/usr/bin/wg show !syslog
+SUDOEOF
+    chmod 440 /etc/sudoers.d/wg-panel-quiet
+    if ! visudo -cf /etc/sudoers.d/wg-panel-quiet >/dev/null 2>&1; then
+        rm -f /etc/sudoers.d/wg-panel-quiet
+        echo "    (skipped journald-quiet sudoers drop-in; visudo validation failed)"
+    else
+        echo "    Journald noise reduction applied (/etc/sudoers.d/wg-panel-quiet)"
+    fi
+fi
+
 echo "[8/8] Setting up update alias..."
 ALIAS_LINE="alias wgdeploy='cd $INSTALL_DIR && sudo ./update.sh'"
 

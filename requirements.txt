@@ -1,0 +1,6 @@
+# LeathGuard runtime dependencies (pinned for reproducible deploys)
+# Update deliberately; the transactional updater import-self-tests before install.
+Flask==3.1.3
+waitress==3.0.2
+Werkzeug==3.1.3
+geoip2==4.8.1

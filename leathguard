@@ -52,10 +52,25 @@ cmd_adopt() {
     local svc; svc=$(lg_detect_service)
     [[ -n "$svc" ]] || { echo "Could not detect a wg-panel service unit"; exit 1; }
     lg_detect_from_unit "$svc" || { echo "Could not parse unit file for $svc"; exit 1; }
-    local iface; iface=$(lg_detect_interface)
+    # Non-interactive support: --interface, --stagger, --join <token> --url <u>
+    local arg_iface="" arg_stagger="" join_token="" join_url=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interface) arg_iface="$2"; shift 2 ;;
+            --stagger) arg_stagger="$2"; shift 2 ;;
+            --join) join_token="$2"; shift 2 ;;
+            --url) join_url="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    local iface="${arg_iface:-$(lg_detect_interface)}"
     if [[ -z "$iface" ]]; then
-        echo "Multiple/zero WireGuard interfaces and none declared in the unit."
-        read -rp "Which interface does this panel manage? " iface
+        if [[ -t 0 ]]; then
+            echo "Multiple/zero WireGuard interfaces and none declared in the unit."
+            read -rp "Which interface does this panel manage? " iface
+        else
+            echo "ERROR: interface not detected and none supplied (--interface wgN required in non-interactive mode)"; exit 1
+        fi
     fi
     local cdir="/etc/wireguard/${iface}_clients"
 
@@ -73,10 +88,16 @@ CLIENT_DIR="$cdir"
 VENV_DIR="${DET_VENV}"
 # Auto-update stagger for this box (24h clock, local time)
 UPDATE_HOUR="3"
-UPDATE_MINUTE="0"
+UPDATE_MINUTE="${arg_stagger:-0}"
 # Optional: Pushover notifications for update outcomes
 PUSHOVER_TOKEN=""
 PUSHOVER_USER=""
+# Optional: MaxMind GeoLite2 auto-provisioning (leathguard geoip-setup)
+WG_PANEL_GEOIP_ACCOUNT=""
+WG_PANEL_GEOIP_KEY=""
+# Optional: fleet controller (future) - empty = standalone
+FLEET_URL="${join_url}"
+BOX_TOKEN=""
 EOF
     chmod 600 "$LG_CONF"
     echo "Contract written: $LG_CONF"
@@ -89,6 +110,68 @@ EOF
         echo "'sudo leathguard doctor --fix' for self-healable ones) before updating."
         exit 1
     }
+}
+
+cmd_test_notify() {
+    # Prove the Pushover path works before trusting unattended updates.
+    [[ -f "$LG_CONF" ]] || { echo "No contract - run: sudo leathguard adopt"; exit 1; }
+    if [[ -z "$PUSHOVER_TOKEN" || -z "$PUSHOVER_USER" ]]; then
+        echo "Pushover not configured in $LG_CONF (PUSHOVER_TOKEN/PUSHOVER_USER empty)."
+        echo "Notifications are disabled; unattended updates will log-only."
+        exit 1
+    fi
+    echo "Sending test notification via Pushover..."
+    local resp
+    resp=$(curl -s --max-time 10 \
+        -F "token=$PUSHOVER_TOKEN" -F "user=$PUSHOVER_USER" \
+        -F "title=[$BOX_NAME] LeathGuard test" \
+        -F "message=Notification path is working. You will get alerts on update success, rollback, and abort." \
+        https://api.pushover.net/1/messages.json)
+    if echo "$resp" | grep -q '"status":1'; then
+        echo "OK - check your device. ($resp)"
+    else
+        echo "FAILED - Pushover returned: $resp"
+        exit 1
+    fi
+}
+
+cmd_geoip_setup() {
+    # Item: GeoIP auto-provisioning. Reads MaxMind creds from the contract,
+    # installs geoipupdate, pulls GeoLite2-City, symlinks it where the panel
+    # looks. Idempotent; safe to re-run. Also installs the geoip2 py lib.
+    [[ $EUID -eq 0 ]] || { echo "Run as root: sudo leathguard geoip-setup"; exit 1; }
+    [[ -f "$LG_CONF" ]] || { echo "No contract - run: sudo leathguard adopt"; exit 1; }
+    if [[ -z "${WG_PANEL_GEOIP_ACCOUNT:-}" || -z "${WG_PANEL_GEOIP_KEY:-}" ]]; then
+        echo "MaxMind credentials not set in $LG_CONF"
+        echo "Add WG_PANEL_GEOIP_ACCOUNT and WG_PANEL_GEOIP_KEY, then re-run."
+        exit 1
+    fi
+    echo "[geoip] installing geoipupdate + geoip2 library..."
+    apt-get update -qq && apt-get install -y -qq geoipupdate >/dev/null 2>&1 || {
+        echo "[geoip] WARNING: apt install geoipupdate failed; continuing (may already be present)"; }
+    "${VENV_DIR:-$INSTALL_DIR/venv}/bin/python" -m pip install --quiet geoip2 2>/dev/null ||         echo "[geoip] WARNING: could not install geoip2 lib into venv"
+
+    echo "[geoip] writing /etc/GeoIP.conf..."
+    cat > /etc/GeoIP.conf <<EOF
+AccountID ${WG_PANEL_GEOIP_ACCOUNT}
+LicenseKey ${WG_PANEL_GEOIP_KEY}
+EditionIDs GeoLite2-City
+EOF
+    chmod 600 /etc/GeoIP.conf
+
+    echo "[geoip] pulling GeoLite2-City database..."
+    if geoipupdate; then
+        local db=/var/lib/GeoIP/GeoLite2-City.mmdb
+        if [[ -f "$db" ]]; then
+            ln -sf "$db" "$INSTALL_DIR/GeoLite2-City.mmdb"
+            echo "[geoip] OK - database at $db, symlinked to $INSTALL_DIR/GeoLite2-City.mmdb"
+            echo "[geoip] restart the panel to activate: sudo systemctl restart $SERVICE_NAME"
+        else
+            echo "[geoip] ERROR: geoipupdate ran but database not found at $db"; exit 1
+        fi
+    else
+        echo "[geoip] ERROR: geoipupdate failed (check credentials in $LG_CONF)"; exit 1
+    fi
 }
 
 cmd_auto_update() {
@@ -201,6 +284,8 @@ cmd_help() {
     echo "  adopt           Generate this box's environment contract (env.conf)"
     echo "  doctor [--fix]  Verify box matches its contract (preflight)"
     echo "  auto-update <enable|disable|status>  Manage unattended updates"
+    echo "  test-notify     Send a test Pushover notification"
+    echo "  geoip-setup     Install + provision MaxMind GeoLite2 (needs creds in env.conf)"
     echo "  restart         Restart the service"
     echo "  start           Start the service"
     echo "  stop            Stop the service"
@@ -224,6 +309,8 @@ case "${1:-help}" in
     doctor)     shift; cmd_doctor "$@" ;;
     adopt)      shift; cmd_adopt "$@" ;;
     auto-update) shift; cmd_auto_update "$@" ;;
+    test-notify) shift; cmd_test_notify "$@" ;;
+    geoip-setup) shift; cmd_geoip_setup "$@" ;;
     status)     cmd_status ;;
     restart)    cmd_restart ;;
     start)      cmd_start ;;

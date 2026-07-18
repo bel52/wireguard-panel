@@ -87,7 +87,7 @@ def get_app_version():
                     return f.read().strip()
             except Exception:
                 pass
-    return '6.3.0'  # Fallback default
+    return '6.4.0'  # Fallback default
 
 APP_VERSION = get_app_version()
 
@@ -161,6 +161,60 @@ CREDENTIAL_SOURCE = ''  # Track credential source: 'env' or 'database'
 GEOIP_CACHE = {}
 GEOIP_PENDING = set()  # IPs currently being looked up in background
 GEOIP_LOCK = threading.Lock()  # Thread safety for GeoIP operations
+# GeoLite2 local database (preferred over remote API when present).
+# Path overridable via env; default matches install layout. When the file
+# is absent the code transparently falls back to the ip-api.com HTTP API.
+GEOIP_DB_PATH = os.environ.get('WG_PANEL_GEOIP_DB', '/opt/wg-panel/GeoLite2-City.mmdb')
+_GEOIP_READER = None
+_GEOIP_READER_TRIED = False
+
+def _geoip_reader():
+    """Lazily open the GeoLite2 reader once. Returns None if unavailable
+    (missing file or geoip2 not installed) so callers fall back to the API."""
+    global _GEOIP_READER, _GEOIP_READER_TRIED
+    if _GEOIP_READER_TRIED:
+        return _GEOIP_READER
+    _GEOIP_READER_TRIED = True
+    try:
+        if os.path.exists(GEOIP_DB_PATH):
+            try:
+                import geoip2.database  # soft dependency
+            except ImportError:
+                logger.info("GeoIP: geoip2 library not installed; using ip-api.com fallback")
+                return None
+            _GEOIP_READER = geoip2.database.Reader(GEOIP_DB_PATH)
+            logger.info(f"GeoIP: using local GeoLite2 database at {GEOIP_DB_PATH}")
+        else:
+            logger.info("GeoIP: no local GeoLite2 DB; falling back to ip-api.com HTTP API")
+    except Exception as e:
+        logger.warning(f"GeoIP: could not open GeoLite2 DB ({e}); using ip-api.com fallback")
+        _GEOIP_READER = None
+    return _GEOIP_READER
+
+def _geoip_from_db(check_ip):
+    """Look up an IP in the local GeoLite2 DB. Returns a result dict or None.
+    'source' marks provenance; 'accuracy_km' surfaces MaxMind's own accuracy
+    radius so the UI can be honest about precision."""
+    reader = _geoip_reader()
+    if reader is None:
+        return None
+    try:
+        r = reader.city(check_ip)
+        return {
+            'country': r.country.name or '',
+            'country_code': (r.country.iso_code or '').lower(),
+            'city': r.city.name or '',
+            'isp': '',  # City DB has no ISP; ASN DB would be a separate lookup
+            'lat': r.location.latitude,
+            'lon': r.location.longitude,
+            'accuracy_km': r.location.accuracy_radius,  # MaxMind's own estimate
+            'source': 'geolite2',
+            '_time': time.time(),
+            '_failed': False,
+        }
+    except Exception:
+        # geoip2.errors.AddressNotFoundError and friends -> treat as no data
+        return None
 CONNECTION_THRESHOLD_SECONDS = 600  # 10 minutes - phones can be idle
 DISCONNECT_GRACE_SECONDS = 120  # Wait 2 minutes before logging disconnect
 SESSION_RESET_THRESHOLD = 1800  # 30 minutes offline before a new session starts
@@ -424,6 +478,23 @@ def update_credentials(new_username=None, new_password=None):
                 AUTH_PASS_HASH = password_hash
                 AUTH_PASS_PLAIN = ''  # Clear plain password
                 logger.info("Password updated")
+
+                # LOCKOUT GUARD: if the password is now DB-sourced but the
+                # username is still only in an env var (no DB row yet),
+                # persist the current username too. Otherwise a later removal
+                # of the env vars leaves a DB password with no DB username,
+                # falling back to the 'admin' default -> lockout. (This is the
+                # exact failure mode hit during the AWS/Raspi migrations.)
+                if not new_username:
+                    existing = conn.execute(
+                        "SELECT 1 FROM app_settings WHERE key='auth_username'"
+                    ).fetchone()
+                    if not existing and AUTH_USER:
+                        conn.execute('''
+                            INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                            VALUES ('auth_username', ?, datetime('now'))
+                        ''', (AUTH_USER,))
+                        logger.info(f"Username '{AUTH_USER}' persisted to DB alongside password (lockout guard)")
 
             conn.commit()
             return True
@@ -792,7 +863,7 @@ def parse_bytes(s):
         multipliers = {'b': 1, 'kib': 1024, 'mib': 1024**2, 'gib': 1024**3, 'tib': 1024**4,
                        'kb': 1000, 'mb': 1000**2, 'gb': 1000**3, 'tb': 1000**4}
         return int(num * multipliers.get(unit, 1))
-    except:
+    except Exception:
         return 0
 
 def format_bytes(b):
@@ -822,7 +893,15 @@ def format_duration(seconds):
         return f"{secs}s"
 
 def _do_geoip_lookup(check_ip):
-    """Background thread worker for GeoIP lookups."""
+    """Background thread worker for GeoIP lookups. Local GeoLite2 DB first
+    (instant, private, consistent); ip-api.com only as fallback."""
+    db_result = _geoip_from_db(check_ip)
+    if db_result is not None:
+        with GEOIP_LOCK:
+            GEOIP_CACHE[check_ip] = db_result
+        with GEOIP_LOCK:
+            GEOIP_PENDING.discard(check_ip)
+        return
     try:
         import urllib.request
         url = f"http://ip-api.com/json/{check_ip}?fields=status,country,countryCode,city,isp,lat,lon"
@@ -836,6 +915,8 @@ def _do_geoip_lookup(check_ip):
                     'isp': data.get('isp', ''),
                     'lat': data.get('lat'),
                     'lon': data.get('lon'),
+                    'accuracy_km': None,
+                    'source': 'ip-api',
                     '_time': time.time(),
                     '_failed': False
                 }
@@ -931,6 +1012,8 @@ def get_geoip(ip, blocking=False):
                     'isp': data.get('isp', ''),
                     'lat': data.get('lat'),
                     'lon': data.get('lon'),
+                    'accuracy_km': None,
+                    'source': 'ip-api',
                     '_time': time.time(),
                     '_failed': False
                 }
@@ -949,7 +1032,7 @@ def get_server_uptime():
         with open('/proc/uptime', 'r') as f:
             uptime_seconds = float(f.readline().split()[0])
         return format_duration(uptime_seconds)
-    except:
+    except Exception:
         return "unknown"
 
 def get_wg_uptime():
@@ -958,7 +1041,7 @@ def get_wg_uptime():
         result = subprocess.run(['sudo', 'wg', 'show', iface],
                                 capture_output=True, text=True, timeout=5)
         return "active" if result.returncode == 0 else "down"
-    except:
+    except Exception:
         return "unknown"
 
 
@@ -1137,7 +1220,7 @@ def get_client_today_usage(client_name, conn=None):
                 'connection_seconds': row['connection_seconds'],
                 'session_count': row['session_count']
             }
-    except:
+    except Exception:
         pass
     return {'rx_bytes': 0, 'tx_bytes': 0, 'connection_seconds': 0, 'session_count': 0}
 
@@ -1169,7 +1252,7 @@ def format_timestamp_friendly(iso_timestamp):
         else:
             local_dt = dt.astimezone()
             return local_dt.strftime('%b %d at %I:%M %p')
-    except:
+    except Exception:
         return str(iso_timestamp)[:19].replace('T', ' ')
 
 
@@ -1978,7 +2061,7 @@ def get_client_config(name):
                                 capture_output=True, text=True)
         if result.returncode == 0:
             return result.stdout
-    except:
+    except Exception:
         pass
     return None
 
@@ -2597,6 +2680,8 @@ TEMPLATE = '''
         }
         .health-title .status-text.degraded { color: var(--warning); }
         .health-title .status-text.down { color: var(--danger); }
+        .glance-line { display:block; font-size:1.05rem; font-weight:600; line-height:1.3; }
+        .status-text-sub { display:block; font-size:0.78rem; opacity:0.6; margin-top:2px; }
         .health-chevron {
             color: var(--text-secondary);
             transition: transform 0.2s ease;
@@ -3049,7 +3134,8 @@ TEMPLATE = '''
                     <div class="health-status">
                         <div class="health-indicator" id="healthIndicator"></div>
                         <div class="health-title">
-                            Status: <span class="status-text" id="healthStatusText">Checking...</span>
+                            <span class="glance-line" id="healthGlance">Checking your connection…</span>
+                            <span class="status-text-sub">Details: <span class="status-text" id="healthStatusText">Checking...</span></span>
                         </div>
                     </div>
                     <span class="health-chevron" id="healthChevron">▼</span>
@@ -3814,6 +3900,25 @@ TEMPLATE = '''
                 }
 
                 statusText.textContent = health.overall.charAt(0).toUpperCase() + health.overall.slice(1);
+
+                // Plain-language glance line for non-technical users
+                const glance = document.getElementById('healthGlance');
+                if (glance) {
+                    const connected = (currentStats && typeof currentStats.connected_clients === 'number')
+                        ? currentStats.connected_clients : null;
+                    if (health.overall === 'down') {
+                        glance.textContent = '⚠️ Something needs attention';
+                        glance.style.color = 'var(--danger)';
+                    } else if (health.overall === 'degraded') {
+                        glance.textContent = '⚠️ Mostly working — one thing needs a look';
+                        glance.style.color = 'var(--warning)';
+                    } else {
+                        glance.textContent = connected !== null
+                            ? `✅ All good — ${connected} device${connected === 1 ? '' : 's'} connected`
+                            : '✅ All good — your VPN is running';
+                        glance.style.color = 'var(--success, #4fd1a5)';
+                    }
+                }
 
                 // Update details
                 details.innerHTML = health.checks.map(check => `
@@ -4883,12 +4988,20 @@ TEMPLATE = '''
 
                     // Apply demo mode redaction to popup
                     const displayGeo = demoMode ? redactLocation(client.geo) : client.geo;
+                    // Honest labeling: IP geolocation is approximate (it locates
+                    // the internet provider, not the device). Say so, and note
+                    // the source + accuracy when available.
+                    let accuracyNote = 'Approximate (based on internet provider)';
+                    if (displayGeo.accuracy_km) {
+                        accuracyNote = `Approximate · within ~${displayGeo.accuracy_km} km`;
+                    }
                     const popupContent = `
                         <div class="map-popup-title">${client.name}</div>
                         <div class="map-popup-info">
                             ${displayGeo.city ? displayGeo.city + ', ' : ''}${displayGeo.country}<br>
-                            ${client.connected ? '🟢 Connected' : '⚫ Offline'}
+                            ${client.connected ? '🟢 Connected' : '⚫ Offline — last known'}
                             ${client.connected && client.connection_duration_fmt ? ' • ' + client.connection_duration_fmt : ''}
+                            <br><span style="opacity:0.6; font-size:0.85em;">📍 ${accuracyNote}</span>
                         </div>
                     `;
                     marker.bindPopup(popupContent);
