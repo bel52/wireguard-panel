@@ -5,7 +5,13 @@ set -euo pipefail
 # wg-tool — PiVPN-like WireGuard client management
 #
 # Usage:
-#   sudo wg-tool add <name> [endpoint]   Create client + add peer (no disconnect)
+#   sudo wg-tool add <name> [endpoint] [--mode full|split]
+#                                        Create client + add peer (no disconnect)
+#                                        full  = route ALL traffic through VPN (default)
+#                                        split = route only VPN/home subnets
+#   sudo wg-tool mode <name> <full|split> Rewrite client config tunnel mode (same keys)
+#   sudo wg-tool rotate <name>           Rotate client keypair (same name/IP; re-import required)
+#   sudo wg-tool modes                   Print "name|mode" for every client config
 #   sudo wg-tool qr <name>               Print QR code for client config
 #   sudo wg-tool list                    List all client configs and peers
 #   sudo wg-tool revoke <name>           Remove peer + delete client files
@@ -230,6 +236,73 @@ check_nat_rule() {
   fi
 }
 
+# Split-tunnel AllowedIPs: VPN subnet by default; extend via SPLIT_SUBNETS in
+# /etc/wireguard/wg-tool.conf (e.g. SPLIT_SUBNETS="10.50.0.0/24, 192.168.86.0/24")
+split_allowed_ips() {
+  if [[ -f "${WG_DIR}/wg-tool.conf" ]]; then
+    # shellcheck disable=SC1091
+    source "${WG_DIR}/wg-tool.conf"
+  fi
+  if [[ -n "${SPLIT_SUBNETS:-}" ]]; then
+    echo "${SPLIT_SUBNETS}"
+  else
+    echo "${VPN_PREFIX}.0/24"
+  fi
+}
+
+# Write a client config. Args: conf_path priv_key ip endpoint mode
+write_client_conf() {
+  local conf="$1" client_priv="$2" ip="$3" endpoint_host="$4" mode="$5"
+  local server_pub allowed
+  if [[ -n "$SERVER_PUB_KEY" ]]; then
+    server_pub="$SERVER_PUB_KEY"
+  else
+    server_pub="$(cat "$SERVER_PUB")"
+  fi
+  if [[ "$mode" == "split" ]]; then
+    allowed="$(split_allowed_ips)"
+  else
+    mode="full"
+    allowed="0.0.0.0/0, ::/0"
+  fi
+  cat > "$conf" <<EOC
+[Interface]
+# mode: ${mode}
+PrivateKey = ${client_priv}
+Address = ${ip}/32
+DNS = ${DNS_IP}
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${endpoint_host}:${SERVER_PORT}
+AllowedIPs = ${allowed}
+PersistentKeepalive = 25
+EOC
+  chmod 600 "$conf"
+}
+
+# Read the mode of an existing client conf (from marker comment, falling back
+# to AllowedIPs inspection for pre-6.2 configs)
+client_mode() {
+  local conf="$1"
+  local m
+  m=$(grep -E '^# mode:' "$conf" 2>/dev/null | awk '{print $3}')
+  if [[ -z "$m" ]]; then
+    if grep -qE '^AllowedIPs *= *0\.0\.0\.0/0' "$conf" 2>/dev/null; then
+      m="full"
+    else
+      m="split"
+    fi
+  fi
+  echo "$m"
+}
+
+# Read the stored Endpoint host (without port) from an existing client conf
+client_endpoint_host() {
+  local conf="$1"
+  grep -E '^Endpoint *=' "$conf" 2>/dev/null | head -1 | sed -E 's/^Endpoint *= *//; s/:[0-9]+$//'
+}
+
 cmd_add() {
   need_root add "$@"
   ensure_prereqs
@@ -237,10 +310,22 @@ cmd_add() {
   # Ensure NAT rule exists for this subnet
   check_nat_rule
 
-  local name="${1:-}"
-  [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip]"; exit 1; }
+  # Parse args: positionals (name, endpoint) plus optional --mode full|split
+  local name="" endpoint_host="" mode="full"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode) mode="${2:-full}"; shift 2 ;;
+      --mode=*) mode="${1#--mode=}"; shift ;;
+      *)
+        if [[ -z "$name" ]]; then name="$1"
+        elif [[ -z "$endpoint_host" ]]; then endpoint_host="$1"
+        fi
+        shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || { echo "Usage: wg-tool add <client_name> [endpoint_host_or_ip] [--mode full|split]"; exit 1; }
+  [[ "$mode" == "full" || "$mode" == "split" ]] || { echo "Invalid --mode: $mode (use full or split)"; exit 1; }
 
-  local endpoint_host="${2:-}"
   if [[ -z "$endpoint_host" ]]; then
     endpoint_host="$(pub_ip)"
     [[ -n "$endpoint_host" ]] || endpoint_host="YOUR_PUBLIC_IP_OR_DNS"
@@ -258,15 +343,9 @@ cmd_add() {
   umask 077
   wg genkey | tee "$key" | wg pubkey | tee "$pub" >/dev/null
 
-  local client_priv client_pub server_pub
+  local client_priv client_pub
   client_priv="$(cat "$key")"
   client_pub="$(cat "$pub")"
-  # Use auto-detected server public key, or fall back to file
-  if [[ -n "$SERVER_PUB_KEY" ]]; then
-    server_pub="$SERVER_PUB_KEY"
-  else
-    server_pub="$(cat "$SERVER_PUB")"
-  fi
 
   # Append peer (with trailing newline for clean formatting)
   cat >> "$WG_CONF" <<EOP
@@ -277,25 +356,98 @@ PublicKey = ${client_pub}
 AllowedIPs = ${ip}/32
 EOP
 
-  # Full tunnel (PiVPN-like)
-  cat > "$conf" <<EOC
-[Interface]
-PrivateKey = ${client_priv}
-Address = ${ip}/32
-DNS = ${DNS_IP}
-
-[Peer]
-PublicKey = ${server_pub}
-Endpoint = ${endpoint_host}:${SERVER_PORT}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOC
-
-  chmod 600 "$conf"
+  write_client_conf "$conf" "$client_priv" "$ip" "$endpoint_host" "$mode"
   apply_config
 
-  echo "OK: created ${conf}"
+  echo "OK: created ${conf} (mode: ${mode})"
   echo "Tip: wg-tool qr ${name}"
+}
+
+cmd_mode() {
+  # Rewrite an existing client config with a different tunnel mode.
+  # Keys, IP, and endpoint are preserved; the client must re-import the
+  # config (or rescan the QR) for the change to take effect on-device.
+  need_root mode "$@"
+  ensure_prereqs
+  local name="${1:-}" mode="${2:-}"
+  [[ -n "$name" && ( "$mode" == "full" || "$mode" == "split" ) ]] || {
+    echo "Usage: wg-tool mode <client_name> <full|split>"; exit 1; }
+
+  local conf="${CLIENT_DIR}/${name}.conf"
+  local key="${CLIENT_DIR}/${name}.key"
+  [[ -f "$conf" ]] || { echo "Missing: $conf"; exit 1; }
+  [[ -f "$key" ]]  || { echo "Missing: $key (cannot rewrite config)"; exit 1; }
+
+  local ip endpoint_host client_priv
+  ip=$(grep -E '^Address *=' "$conf" | head -1 | sed -E 's/^Address *= *//; s|/32||')
+  endpoint_host=$(client_endpoint_host "$conf")
+  client_priv="$(cat "$key")"
+  [[ -n "$ip" && -n "$endpoint_host" ]] || { echo "Could not parse existing config"; exit 1; }
+
+  cp -a "$conf" "${conf}.bak_mode_$(date +%Y%m%d_%H%M%S)"
+  umask 077
+  write_client_conf "$conf" "$client_priv" "$ip" "$endpoint_host" "$mode"
+  echo "OK: ${name} is now ${mode} tunnel. Re-import required on the device (new QR/config)."
+}
+
+cmd_rotate() {
+  # Rotate a client keypair: new private/public key, same name/IP/mode.
+  # Server peer entry is updated in place; the old key stops working the
+  # moment the config is applied. The device must import the new config.
+  need_root rotate "$@"
+  ensure_prereqs
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: wg-tool rotate <client_name>"; exit 1; }
+
+  local conf="${CLIENT_DIR}/${name}.conf"
+  local key="${CLIENT_DIR}/${name}.key"
+  local pubf="${CLIENT_DIR}/${name}.pub"
+  [[ -f "$conf" && -f "$pubf" ]] || { echo "Missing client files for ${name}"; exit 1; }
+
+  local old_pub ip endpoint_host mode
+  old_pub="$(cat "$pubf")"
+  ip=$(grep -E '^Address *=' "$conf" | head -1 | sed -E 's/^Address *= *//; s|/32||')
+  endpoint_host=$(client_endpoint_host "$conf")
+  mode="$(client_mode "$conf")"
+  [[ -n "$ip" && -n "$endpoint_host" ]] || { echo "Could not parse existing config"; exit 1; }
+
+  # Generate new keypair
+  umask 077
+  local new_priv new_pub
+  new_priv="$(wg genkey)"
+  new_pub="$(printf '%s' "$new_priv" | wg pubkey)"
+
+  # Replace PublicKey in the server conf peer block (backup first).
+  # Base64 keys contain only [A-Za-z0-9+/=]; none are BRE metacharacters
+  # ('+' is literal in basic regex) and the '|' delimiter makes '/' safe,
+  # so no escaping is required.
+  cp -a "$WG_CONF" "${WG_CONF}.bak_rotate_$(date +%Y%m%d_%H%M%S)"
+  sed -i "s|^PublicKey *= *${old_pub}\$|PublicKey = ${new_pub}|" "$WG_CONF"
+  if ! grep -q "^PublicKey = ${new_pub}\$" "$WG_CONF"; then
+    echo "ERROR: failed to update server config; restoring backup" >&2
+    cp -a "${WG_CONF}.bak_rotate_"* "$WG_CONF" 2>/dev/null || true
+    exit 1
+  fi
+
+  # Persist new keys + rewrite client config
+  printf '%s\n' "$new_priv" > "$key"
+  printf '%s\n' "$new_pub" > "$pubf"
+  write_client_conf "$conf" "$new_priv" "$ip" "$endpoint_host" "$mode"
+
+  apply_config
+  echo "OK: rotated keys for ${name} (mode: ${mode}). Old key is now invalid; re-import required."
+}
+
+cmd_modes() {
+  # Machine-readable: name|mode for every client config
+  need_root modes "$@"
+  ensure_prereqs
+  local f name
+  for f in "${CLIENT_DIR}"/*.conf; do
+    [[ -f "$f" ]] || continue
+    name=$(basename "$f" .conf)
+    echo "${name}|$(client_mode "$f")"
+  done
 }
 
 cmd_qr() {
@@ -527,6 +679,9 @@ main() {
   case "$cmd" in
     add) cmd_add "$@";;
     qr) cmd_qr "$@";;
+    mode) cmd_mode "$@";;
+    rotate) cmd_rotate "$@";;
+    modes) cmd_modes "$@";;
     list) cmd_list;;
     revoke) cmd_revoke "$@";;
     revoke-orphan) cmd_revoke_orphan "$@";;

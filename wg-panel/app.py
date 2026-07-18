@@ -54,6 +54,13 @@ logging.basicConfig(
 logger = logging.getLogger('leathguard')
 
 app = Flask(__name__)
+
+# Behind a reverse proxy / Cloudflare Tunnel (the recommended loopback-bind
+# deployment), trust one hop of X-Forwarded-Proto/Host so generated absolute
+# URLs (e.g. invite links) carry the public https hostname instead of
+# http://127.0.0.1:5000. Safe because only the local proxy can connect.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 # Secret key will be set properly after database initialization
 # to ensure persistence across restarts
 app.secret_key = 'temporary-key-replaced-on-init'
@@ -80,7 +87,7 @@ def get_app_version():
                     return f.read().strip()
             except Exception:
                 pass
-    return '6.0.0'  # Fallback default
+    return '6.2.0'  # Fallback default
 
 APP_VERSION = get_app_version()
 
@@ -190,6 +197,22 @@ def init_db():
             name TEXT PRIMARY KEY,
             note TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- v6.2: time-limited (guest) clients; collector auto-revokes on expiry
+        CREATE TABLE IF NOT EXISTS client_expiry (
+            name TEXT PRIMARY KEY,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- v6.2: single-use onboarding invite links
+        CREATE TABLE IF NOT EXISTS invite_tokens (
+            token_hash TEXT PRIMARY KEY,
+            client_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            used_at TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS connection_history (
@@ -1394,6 +1417,7 @@ class Collector:
         self._wake = threading.Event()   # set by write endpoints for fast refresh
         self._inventory = []
         self._inventory_dirty = True
+        self._modes = {}
         self._cycle_count = 0
         self._consecutive_failures = 0
         self._last_error = ''
@@ -1480,12 +1504,46 @@ class Collector:
                 self._inventory_dirty = False
             else:
                 logger.warning(f"wg-tool list failed (rc={code}); keeping cached inventory")
+            # Tunnel modes (name|mode per line); tolerate absence on older wg-tool
+            m_out, m_code = run_cmd(['wg-tool', 'modes'])
+            if m_code == 0:
+                modes = {}
+                for line in m_out.split('\n'):
+                    if '|' in line:
+                        n, _, m = line.strip().partition('|')
+                        modes[n.strip()] = m.strip()
+                self._modes = modes
+
+    def _enforce_expiry(self):
+        """Auto-revoke expired guest clients. Runs pre-transaction (revoke
+        spawns subprocesses; must never happen inside a DB transaction)."""
+        try:
+            rows = self._conn.execute(
+                'SELECT name, expires_at FROM client_expiry').fetchall()
+        except sqlite3.Error:
+            return
+        now = utcnow()
+        for row in rows:
+            exp = parse_iso_utc(row['expires_at'])
+            if exp and now >= exp:
+                name = row['name']
+                logger.info(f"Guest client '{name}' expired; auto-revoking")
+                ok, _ = revoke_client(name, event_type='expired')
+                with DB_WRITE_LOCK:
+                    try:
+                        self._conn.execute('DELETE FROM client_expiry WHERE name = ?', (name,))
+                        self._conn.commit()
+                    except sqlite3.Error as e:
+                        logger.warning(f"Failed clearing expiry row for {name}: {e}")
+                if ok:
+                    self._inventory_dirty = True
 
     def _cycle(self):
         now = utcnow()
         now_epoch = time.time()
 
         # ---- Phase 1: external state capture (NO db transaction open) ----
+        self._enforce_expiry()
         self._refresh_inventory_if_needed()
         peers_live = {p['public_key']: p for p in parse_wg_show()}
         server_uptime = get_server_uptime()
@@ -1493,6 +1551,12 @@ class Collector:
 
         # ---- Phase 2: pure reads ----
         paused_clients = get_paused_clients()
+        expiry_map = {}
+        try:
+            for row in self._conn.execute('SELECT name, expires_at FROM client_expiry'):
+                expiry_map[row['name']] = row['expires_at']
+        except sqlite3.Error:
+            pass
 
         # ---- Phase 3: state machine + single write transaction ----
         conn = self._conn
@@ -1504,6 +1568,15 @@ class Collector:
             for item in self._inventory:
                 client = self._process_client(conn, writes, item, peers_live,
                                               paused_clients, now, now_epoch)
+                client['mode'] = self._modes.get(item['name'], 'full')
+                exp = expiry_map.get(item['name'])
+                client['expires_at'] = exp
+                if exp:
+                    exp_dt = parse_iso_utc(exp)
+                    remaining = (exp_dt - now).total_seconds() if exp_dt else 0
+                    client['expires_fmt'] = ('expires in ' + format_duration(remaining)) if remaining > 0 else 'expiring now'
+                else:
+                    client['expires_fmt'] = None
                 clients_out.append(client)
 
             # Orphan peers: live peers with no matching config entry
@@ -1818,25 +1891,63 @@ def log_connection_event(client_name, event_type, endpoint=''):
         finally:
             conn.close()
 
-def add_client(name):
+def add_client(name, mode='full', expires_days=None):
+    """Create a client. mode: 'full' (all traffic) or 'split' (VPN/home
+    subnets only). expires_days: auto-revoke after N days (guest access)."""
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return False, "Invalid name. Use only letters, numbers, underscore, dash."
     if len(name) > 32:
         return False, "Name too long (max 32 chars)."
-    
-    output, code = run_cmd(['wg-tool', 'add', name])
+    if mode not in ('full', 'split'):
+        mode = 'full'
+
+    output, code = run_cmd(['wg-tool', 'add', name, '--mode', mode])
     if code == 0:
         log_connection_event(name, 'created')
+        if expires_days:
+            expires_at = (utcnow() + timedelta(days=int(expires_days))).isoformat()
+            with DB_WRITE_LOCK:
+                conn = get_db()
+                try:
+                    conn.execute('INSERT OR REPLACE INTO client_expiry (name, expires_at) VALUES (?, ?)',
+                                 (name, expires_at))
+                    conn.commit()
+                finally:
+                    conn.close()
         COLLECTOR.request_refresh()
     return code == 0, output
 
-def revoke_client(name, pubkey=None):
-    """Revoke a client by name, or by public key for orphaned peers."""
+
+def rotate_client(name):
+    """Rotate a client keypair. Old key is invalidated immediately; the
+    device must re-import the new config/QR."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return False, "Invalid name"
+    output, code = run_cmd(['wg-tool', 'rotate', name])
+    if code == 0:
+        log_connection_event(name, 'key-rotated')
+        COLLECTOR.request_refresh()
+    return code == 0, output
+
+
+def set_client_mode(name, mode):
+    """Switch a client between full and split tunnel. Device must re-import."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name) or mode not in ('full', 'split'):
+        return False, "Invalid parameters"
+    output, code = run_cmd(['wg-tool', 'mode', name, mode])
+    if code == 0:
+        log_connection_event(name, f'mode-{mode}')
+        COLLECTOR.request_refresh()
+    return code == 0, output
+
+def revoke_client(name, pubkey=None, event_type='revoked'):
+    """Revoke a client by name, or by public key for orphaned peers.
+    event_type lets the expiry path log 'expired' instead of 'revoked'."""
     # Try normal revoke by name first
     if re.match(r'^[a-zA-Z0-9_-]+$', name):
         output, code = run_cmd(['wg-tool', 'revoke', name])
         if code == 0:
-            log_connection_event(name, 'revoked')
+            log_connection_event(name, event_type)
             with DB_WRITE_LOCK:
                 conn = get_db()
                 try:
@@ -1853,7 +1964,7 @@ def revoke_client(name, pubkey=None):
     if pubkey and re.match(r'^[A-Za-z0-9+/]{43}=$', pubkey):
         output, code = run_cmd(['wg-tool', 'revoke-orphan', pubkey])
         if code == 0:
-            log_connection_event(name or 'orphan-peer', 'revoked')
+            log_connection_event(name or 'orphan-peer', event_type)
         return code == 0, output
 
     return False, "Invalid name or missing public key for orphan peer."
@@ -3017,6 +3128,27 @@ TEMPLATE = '''
                         <label>Note (optional)</label>
                         <input type="text" name="note" placeholder="e.g., Dad's laptop">
                     </div>
+                    <div class="form-group">
+                        <label>Traffic mode</label>
+                        <label style="display:block; font-weight:normal; cursor:pointer; margin:6px 0;">
+                            <input type="radio" name="mode" value="full" checked>
+                            &#128274; Protect everything <span style="opacity:.65">&mdash; all traffic goes through the VPN (privacy + ad-blocking everywhere)</span>
+                        </label>
+                        <label style="display:block; font-weight:normal; cursor:pointer; margin:6px 0;">
+                            <input type="radio" name="mode" value="split">
+                            &#127968; Home access only <span style="opacity:.65">&mdash; reach home devices, browse at normal speed</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>Access duration</label>
+                        <select name="expires" style="width:100%; padding:8px; border-radius:8px; background:var(--bg-input, rgba(255,255,255,0.06)); color:inherit; border:1px solid rgba(255,255,255,0.15);">
+                            <option value="">Permanent</option>
+                            <option value="1">Guest pass &mdash; 24 hours</option>
+                            <option value="3">Guest pass &mdash; 3 days</option>
+                            <option value="7">Guest pass &mdash; 7 days</option>
+                            <option value="30">Guest pass &mdash; 30 days</option>
+                        </select>
+                    </div>
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" onclick="hideModals()">Cancel</button>
                         <button type="submit" class="btn">Add Client</button>
@@ -3846,6 +3978,78 @@ TEMPLATE = '''
             }
 
             // ===== Pause/Unpause =====
+            function createInvite(name) {
+                apiFetch('/api/invite', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+                    body: JSON.stringify({ name: name })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    if (data.success) {
+                        copyToClipboard(data.link);
+                        alert(`Setup link for "${name}" copied to your clipboard!\n\n${data.link}\n\nSend it to them however you like (text, email). It works ONCE and expires in ${data.expires_hours} hours if unused.`);
+                    } else {
+                        alert('Failed to create invite: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;
+                    alert('Error: ' + err.message);
+                });
+            }
+
+            function rotateKeys(name) {
+                if (!confirm(`Rotate keys for "${name}"?\n\nThe device's current VPN config will STOP WORKING immediately. You'll need to scan the new QR code (or import the new config) on the device.`)) return;
+
+                apiFetch('/api/rotate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+                    body: JSON.stringify({ name: name })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        refreshDashboard();
+                        showQR(name);  // hand the new QR to the admin immediately
+                    } else {
+                        alert('Failed to rotate: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;
+                    alert('Error: ' + err.message);
+                });
+            }
+
+            function switchMode(name, newMode) {
+                const label = newMode === 'full'
+                    ? 'Protect everything - all traffic goes through the VPN'
+                    : 'Home access only - reaches home devices, browses at normal speed';
+                if (!confirm(`Switch "${name}" to: ${label}?\n\nThe device must re-import the config (scan the new QR) for this to take effect.`)) return;
+
+                apiFetch('/api/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+                    body: JSON.stringify({ name: name, mode: newMode })
+                })
+                .then(safeParseJSON)
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        refreshDashboard();
+                        showQR(name);
+                    } else {
+                        alert('Failed to switch mode: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    if (err.message === 'Session expired') return;
+                    alert('Error: ' + err.message);
+                });
+            }
+
             function pauseClient(name) {
                 if (!confirm(`Pause internet for "${name}"? They will stay connected to VPN but cannot access the internet.`)) return;
 
@@ -4440,6 +4644,8 @@ TEMPLATE = '''
                                 ${c.note || c.name}
                                 ${c.note ? `<span class="system-name-badge">${c.name}</span>` : ''}
                                 ${c.paused ? '<span class="paused-badge">⏸ PAUSED</span>' : ''}
+                                ${c.mode === 'split' ? '<span class="system-name-badge" title="Home access only - reaches home devices, browses normally">🏠 home only</span>' : ''}
+                                ${c.expires_fmt ? `<span class="system-name-badge" style="color:#ffaa00" title="Guest access - will be removed automatically">⏳ ${c.expires_fmt}</span>` : ''}
                                 ${handshakeDisplay ? `<span class="handshake-badge ${handshakeStale ? 'stale' : ''}">${handshakeDisplay}</span>` : ''}
                             </h3>
                             <div class="client-meta">
@@ -4467,6 +4673,9 @@ TEMPLATE = '''
                             <button class="icon-btn" onclick="showConfig('${c.name}')" title="Config">📄</button>
                             <a href="/download/${c.name}" class="icon-btn" title="Download">⬇️</a>
                             <button class="icon-btn" onclick="showNote('${c.name}', '${(c.note || '').replace(/'/g, "\\'")}')" title="Edit Note">✏️</button>
+                            ${!c.orphan ? `<button class="icon-btn" onclick="createInvite('${c.name}')" title="Create one-time setup link to send to this person">📨</button>` : ''}
+                            ${!c.orphan ? `<button class="icon-btn" onclick="switchMode('${c.name}', '${c.mode === 'split' ? 'full' : 'split'}')" title="${c.mode === 'split' ? 'Switch to: Protect everything (all traffic through VPN)' : 'Switch to: Home access only'}">${c.mode === 'split' ? '🔒' : '🏠'}</button>` : ''}
+                            ${!c.orphan ? `<button class="icon-btn" onclick="rotateKeys('${c.name}')" title="Rotate keys (old config stops working)">🔑</button>` : ''}
                             <button class="icon-btn danger" onclick="confirmRevoke('${c.name}', '${c.public_key}')" title="Revoke">🗑️</button>
                         </div>
                     </div>
@@ -5070,6 +5279,236 @@ def api_unpause():
         return jsonify({'ok': False, 'error': msg}), 400
     return jsonify({'error': 'invalid request'}), 400
 
+INVITE_INVALID_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link expired</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#12141f;color:#e8eaf2;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;text-align:center}
+.card{max-width:420px;background:#1c1f2e;border-radius:16px;padding:36px 28px}</style></head>
+<body><div class="card"><div style="font-size:44px">&#9203;</div>
+<h2>This setup link has expired</h2>
+<p style="opacity:.75;line-height:1.5">Setup links only work once and expire after a few days for security. Ask whoever sent it to generate a fresh one.</p>
+</div></body></html>"""
+
+INVITE_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN setup for {{ client_name }}</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;background:#12141f;color:#e8eaf2;margin:0;padding:20px;display:flex;justify-content:center}
+.wrap{max-width:480px;width:100%}
+.card{background:#1c1f2e;border-radius:16px;padding:26px;margin-bottom:16px}
+h1{font-size:22px;margin:0 0 6px} h2{font-size:16px;margin:0 0 10px}
+.step{display:flex;gap:14px;margin-bottom:8px}
+.num{background:#4fd1a5;color:#12141f;font-weight:700;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+p{line-height:1.55;margin:6px 0;opacity:.9}
+a.btn,button.btn{display:inline-block;background:#4fd1a5;color:#12141f;font-weight:600;padding:12px 20px;border-radius:10px;text-decoration:none;border:none;font-size:15px;cursor:pointer;margin:6px 6px 0 0}
+a.btn.secondary{background:#2a2e42;color:#e8eaf2}
+img.qr{background:#fff;padding:12px;border-radius:12px;width:100%;max-width:260px;display:block;margin:12px auto}
+.muted{opacity:.6;font-size:13px}
+.hide{display:none}
+</style></head>
+<body><div class="wrap">
+<div class="card">
+  <h1>&#128737;&#65039; Set up your secure connection</h1>
+  <p>This link sets up the VPN profile <b>{{ client_name }}</b> on this device. It takes about two minutes.</p>
+  <p class="muted">This page works once and stays open for {{ grace_minutes }} minutes &mdash; finish the steps before closing it.</p>
+</div>
+
+<div class="card" id="stepInstall">
+  <div class="step"><div class="num">1</div><h2>Install the WireGuard app</h2></div>
+  <p>It's the official, free VPN app this profile uses.</p>
+  <a class="btn" id="storeLink" href="https://www.wireguard.com/install/" target="_blank" rel="noopener">Get WireGuard</a>
+  <p class="muted" id="storeHint"></p>
+</div>
+
+<div class="card" id="stepImportMobile">
+  <div class="step"><div class="num">2</div><h2>Add your profile</h2></div>
+  <p id="mobileImportText">Tap the button below, then choose <b>Open in WireGuard</b> (or open the WireGuard app &rarr; <b>+</b> &rarr; <b>Create from file</b> and pick the downloaded file).</p>
+  <a class="btn" href="config">Download my VPN profile</a>
+  <p>On a different device? Open the WireGuard app there, tap <b>+</b> &rarr; <b>Scan from QR code</b>, and scan this:</p>
+  <img class="qr" src="qr.png" alt="Setup QR code">
+</div>
+
+<div class="card">
+  <div class="step"><div class="num">3</div><h2>Turn it on</h2></div>
+  <p>In the WireGuard app, flip the switch next to <b>{{ client_name }}</b>. That's it &mdash; you're protected.</p>
+  <p class="muted">You can leave it on all the time. If anything doesn't work, contact the person who sent you this link.</p>
+</div>
+</div>
+<script>
+(function(){
+  var ua = navigator.userAgent;
+  var link = document.getElementById('storeLink');
+  var hint = document.getElementById('storeHint');
+  if (/iPhone|iPad|iPod/.test(ua)) {
+    link.href = 'https://apps.apple.com/app/wireguard/id1441195209';
+    link.textContent = 'Get WireGuard from the App Store';
+  } else if (/Android/.test(ua)) {
+    link.href = 'https://play.google.com/store/apps/details?id=com.wireguard.android';
+    link.textContent = 'Get WireGuard from Google Play';
+  } else {
+    hint.textContent = 'On a computer, download WireGuard for your operating system, then use "Import tunnel from file" with the profile below.';
+  }
+})();
+</script>
+</body></html>"""
+
+# --------------- v6.2b: Onboarding invites ---------------
+# Single-use invite links let a non-technical person set up their own device
+# without the admin present. Security model:
+# - 256-bit token (secrets.token_urlsafe(32)); only its SHA256 is stored
+# - expires after INVITE_VALID_HOURS (default 72h) if never opened
+# - first open stamps used_at; the page/QR/config remain valid for a
+#   INVITE_GRACE_MINUTES window after first open (tolerates reloads while
+#   preventing long-lived link sharing), then the token is dead
+# - invalid tokens return a uniform 404 after a small constant delay
+
+INVITE_VALID_HOURS = 72
+INVITE_GRACE_MINUTES = 15
+
+def create_invite(name, hours=INVITE_VALID_HOURS):
+    """Create a single-use invite token for an existing client. Returns the
+    raw token (shown once to the admin) or None."""
+    import hashlib
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return None
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires_at = (utcnow() + timedelta(hours=hours)).isoformat()
+    with DB_WRITE_LOCK:
+        conn = get_db()
+        try:
+            # One live invite per client: replace any previous token
+            conn.execute('DELETE FROM invite_tokens WHERE client_name = ?', (name,))
+            conn.execute('INSERT INTO invite_tokens (token_hash, client_name, expires_at) VALUES (?, ?, ?)',
+                         (token_hash, name, expires_at))
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            logger.error(f"Failed to create invite: {e}")
+            return None
+        finally:
+            conn.close()
+    log_connection_event(name, 'invite-created')
+    return token
+
+def validate_invite(token, mark_used=False):
+    """Return the client name for a valid token, else None. Stamps used_at
+    on first open when mark_used=True."""
+    import hashlib
+    if not token or len(token) > 128:
+        time.sleep(0.2)
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT client_name, expires_at, used_at FROM invite_tokens WHERE token_hash = ?',
+                           (token_hash,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        time.sleep(0.2)
+        return None
+    now = utcnow()
+    expires_at = parse_iso_utc(row['expires_at'])
+    if expires_at and now >= expires_at:
+        return None
+    if row['used_at']:
+        used_at = parse_iso_utc(row['used_at'])
+        if used_at and now >= used_at + timedelta(minutes=INVITE_GRACE_MINUTES):
+            return None
+    elif mark_used:
+        with DB_WRITE_LOCK:
+            c2 = get_db()
+            try:
+                c2.execute('UPDATE invite_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL',
+                           (now.isoformat(), token_hash))
+                c2.commit()
+            finally:
+                c2.close()
+    return row['client_name']
+
+
+@app.route('/api/invite', methods=['POST'])
+@login_required
+@csrf_required
+def api_invite():
+    """Generate a single-use onboarding link for an existing client."""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Name required'}), 400
+    token = create_invite(name)
+    if not token:
+        return jsonify({'error': 'Could not create invite'}), 500
+    link = request.url_root.rstrip('/') + '/invite/' + token
+    return jsonify({'success': True, 'link': link,
+                    'expires_hours': INVITE_VALID_HOURS,
+                    'message': f'One-time setup link created. It works once (with a {INVITE_GRACE_MINUTES}-minute window) and expires in {INVITE_VALID_HOURS} hours if unused.'})
+
+
+@app.route('/invite/<token>')
+def invite_page(token):
+    """PUBLIC guided onboarding page (no login - the token is the auth).
+    If the panel sits behind Cloudflare Access, add a path bypass for
+    /invite/* so invitees can reach it."""
+    name = validate_invite(token, mark_used=True)
+    if not name:
+        return Response(INVITE_INVALID_HTML, mimetype='text/html', status=404)
+    return render_template_string(INVITE_TEMPLATE, client_name=name, token=token,
+                                  grace_minutes=INVITE_GRACE_MINUTES)
+
+
+@app.route('/invite/<token>/qr.png')
+def invite_qr(token):
+    name = validate_invite(token)
+    if not name:
+        return ('Not found', 404)
+    qr = get_client_qr(name)
+    return Response(qr, mimetype='image/png') if qr else ('Not found', 404)
+
+
+@app.route('/invite/<token>/config')
+def invite_config(token):
+    name = validate_invite(token)
+    if not name:
+        return ('Not found', 404)
+    conf = get_client_config(name)
+    if not conf:
+        return ('Not found', 404)
+    return Response(conf, mimetype='application/octet-stream',
+                    headers={'Content-Disposition': f'attachment; filename={name}.conf'})
+
+
+@app.route('/api/rotate', methods=['POST'])
+@login_required
+@csrf_required
+def api_rotate():
+    """Rotate a client's keypair. Old key stops working immediately."""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Name required'}), 400
+    success, msg = rotate_client(name)
+    if success:
+        return jsonify({'success': True, 'message': f'Keys rotated for {name}. The device must scan the new QR code or import the new config file - the old one no longer works.'})
+    return jsonify({'error': msg}), 500
+
+@app.route('/api/mode', methods=['POST'])
+@login_required
+@csrf_required
+def api_mode():
+    """Switch a client between full and split tunnel."""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    mode = (data.get('mode') or '').strip()
+    if not name or mode not in ('full', 'split'):
+        return jsonify({'error': 'Name and mode (full|split) required'}), 400
+    success, msg = set_client_mode(name, mode)
+    if success:
+        label = 'Protect everything' if mode == 'full' else 'Home access only'
+        return jsonify({'success': True, 'message': f'{name} switched to "{label}". The device must re-import the config (new QR) for this to take effect.'})
+    return jsonify({'error': msg}), 500
+
 @app.route('/api/settings/password', methods=['POST'])
 @login_required
 @csrf_required
@@ -5457,8 +5896,11 @@ def api_auto_update():
 def add():
     name = request.form.get('name', '').strip()
     note = request.form.get('note', '').strip()
+    mode = request.form.get('mode', 'full').strip()
+    expires = request.form.get('expires', '').strip()  # '', '1', '3', '7', '30'
+    expires_days = int(expires) if expires.isdigit() and 0 < int(expires) <= 365 else None
     if name:
-        success, msg = add_client(name)
+        success, msg = add_client(name, mode=mode, expires_days=expires_days)
         if success:
             if note:
                 update_client_note(name, note)
