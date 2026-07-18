@@ -62,10 +62,12 @@ echo "[2/8] Installing wg-tool CLI..."
 cp "$SCRIPT_DIR/wg-tool" /usr/local/sbin/wg-tool
 chmod 755 /usr/local/sbin/wg-tool
 
-# Install leathguard global CLI
+# Install leathguard global CLI + contract library
 echo "[3/8] Installing leathguard CLI..."
 cp "$SCRIPT_DIR/leathguard" /usr/local/bin/leathguard
 chmod +x /usr/local/bin/leathguard
+mkdir -p /usr/local/lib/leathguard
+cp "$SCRIPT_DIR/lib/contract.sh" /usr/local/lib/leathguard/contract.sh 2>/dev/null || true
 
 # Create install directory
 echo "[4/8] Setting up web panel..."
@@ -79,8 +81,8 @@ fi
 # Create virtual environment
 echo "[5/8] Creating Python environment..."
 python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$INSTALL_DIR/venv/bin/pip" install --quiet flask waitress
+"$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
+"$INSTALL_DIR/venv/bin/python" -m pip install --quiet flask waitress
 
 # Generate PBKDF2 password hash (v6: no more unsalted SHA256)
 PASS_HASH=$(WG_INSTALL_PASS="$WG_PASS" "$INSTALL_DIR/venv/bin/python3" -c "
@@ -150,6 +152,25 @@ elif command -v ufw &>/dev/null && ufw status | grep -q "active"; then
 else
     echo "    UFW not active (ensure cloud firewall allows port $PORT)"
 fi
+
+# Write the environment contract (v6.3) so this box is auto-update-ready
+mkdir -p /etc/leathguard
+cat > /etc/leathguard/env.conf <<EOF
+# LeathGuard environment contract - written by install.sh $(date -u +%Y-%m-%dT%H:%MZ)
+INSTALL_DIR="$INSTALL_DIR"
+APP_ENTRY="$INSTALL_DIR/app.py"
+SERVICE_NAME="wg-panel"
+PANEL_PORT="$PORT"
+WG_INTERFACE="$WG_IFACE"
+CLIENT_DIR="/etc/wireguard/${WG_IFACE}_clients"
+VENV_DIR="$INSTALL_DIR/venv"
+UPDATE_HOUR="3"
+UPDATE_MINUTE="0"
+PUSHOVER_TOKEN=""
+PUSHOVER_USER=""
+EOF
+chmod 600 /etc/leathguard/env.conf
+echo "    Environment contract written: /etc/leathguard/env.conf"
 
 # Setup update alias
 echo "[8/8] Setting up update alias..."

@@ -11,11 +11,22 @@
 # - Atomic file replacement, daemon-reload, restart, readiness check.
 # - AUTOMATIC ROLLBACK if the service fails its readiness check.
 #
+# v6.3: contract-driven + unattended-safe
+# - Reads /etc/leathguard/env.conf (the box contract) for paths/service/port
+# - Runs `leathguard doctor` preflight and REFUSES to touch anything if the
+#   box doesn't match its contract
+# - Honors a repo-level kill switch: if the target release contains a file
+#   named UPDATE_HOLD, unattended runs abort (push the file to pause the
+#   fleet; delete it to resume)
+# - Pushover notification on success / rollback / abort (when configured)
+#
 # Usage: sudo ./update.sh
 #    or: sudo ./update.sh --check          (check for updates only)
 #    or: sudo ./update.sh --tag v6.0.0     (deploy a specific release)
 #    or: sudo ./update.sh --branch main    (deploy tip of a branch)
 #    or: sudo ./update.sh --no-restart     (stage files, skip restart)
+#    or: sudo ./update.sh --unattended     (cron mode: exit silently when
+#                                           already current; notify outcomes)
 
 set -euo pipefail
 
@@ -23,15 +34,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="/opt/wg-panel"
 NO_RESTART=false
 CHECK_ONLY=false
+UNATTENDED=false
 TARGET_TAG=""
 TARGET_BRANCH=""
 READINESS_TIMEOUT=45
+
+# Fallback no-op if the contract lib is unavailable (legacy box)
+lg_notify() { :; }
+
+# ---- Contract (v6.3): read the box's declared environment ----
+for _lib in /usr/local/lib/leathguard/contract.sh "$SCRIPT_DIR/lib/contract.sh"; do
+    if [[ -f "$_lib" ]]; then
+        # shellcheck disable=SC1090
+        source "$_lib"
+        lg_load_contract || true
+        break
+    fi
+done
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-restart) NO_RESTART=true; shift ;;
+        --unattended) UNATTENDED=true; shift ;;
         --check) CHECK_ONLY=true; shift ;;
         --tag) TARGET_TAG="$2"; shift 2 ;;
         --branch) TARGET_BRANCH="$2"; shift 2 ;;
@@ -54,6 +80,26 @@ fi
 
 cd "$SCRIPT_DIR"
 git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
+
+# ---- Preflight: box must match its contract before ANY change ----
+if [[ "$CHECK_ONLY" != "true" ]] && declare -f lg_doctor >/dev/null; then
+    if [[ -f "$LG_CONF" ]]; then
+        if ! lg_doctor > /tmp/lg-doctor-out 2>&1; then
+            cat /tmp/lg-doctor-out
+            echo -e "${RED}Preflight FAILED - refusing to update. Fix the above (sudo leathguard doctor --fix may help).${NC}"
+            lg_notify "Update ABORTED" "Preflight doctor failed; box does not match its contract. No changes made." 1
+            exit 1
+        fi
+        echo "Preflight: contract verified (doctor clean)"
+    else
+        echo -e "${YELLOW}No environment contract at $LG_CONF - running in legacy mode.${NC}"
+        echo -e "${YELLOW}Recommended: sudo leathguard adopt   (required for --unattended)${NC}"
+        if [[ "$UNATTENDED" == "true" ]]; then
+            lg_notify "Update ABORTED" "Unattended update requires an environment contract. Run: sudo leathguard adopt" 1
+            exit 1
+        fi
+    fi
+fi
 
 # ---------------------------------------------------------------
 # Step 1: Determine target ref (pinned tag by default)
@@ -92,6 +138,22 @@ echo "  Target:  ${TARGET_COMMIT:0:9} ($TARGET_DESC)"
 if [[ "$CURRENT_REF" == "$TARGET_COMMIT" ]]; then
     echo -e "  ${GREEN}Already at target${NC}"
     [[ "$CHECK_ONLY" == "true" ]] && exit 0
+    if [[ "$UNATTENDED" == "true" ]]; then
+        # Nothing to do; stay silent (no notification spam every night)
+        exit 0
+    fi
+fi
+
+# ---- Kill switch: a file named UPDATE_HOLD in the target release pauses
+# the fleet. Push it to stop overnight rollouts; delete it to resume. ----
+if git cat-file -e "${TARGET_COMMIT}:UPDATE_HOLD" 2>/dev/null; then
+    echo -e "${YELLOW}UPDATE_HOLD present in target release - rollout is paused.${NC}"
+    if [[ "$UNATTENDED" == "true" ]]; then
+        lg_notify "Update HELD" "Target $TARGET_DESC contains UPDATE_HOLD; unattended rollout paused." 0
+        exit 0
+    fi
+    read -rp "Proceed anyway? [y/N] " _ans
+    [[ "$_ans" == "y" || "$_ans" == "Y" ]] || exit 0
 fi
 
 if [[ "$CHECK_ONLY" == "true" ]]; then
@@ -113,7 +175,7 @@ cp -a "$INSTALL_DIR/app.py"  "$BACKUP_DIR/app.py"      2>/dev/null || true
 cp -a "$INSTALL_DIR/VERSION" "$BACKUP_DIR/VERSION"     2>/dev/null || true
 cp -a /etc/systemd/system/wg-panel.service "$BACKUP_DIR/wg-panel.service" 2>/dev/null || true
 cp -a /usr/local/sbin/wg-tool "$BACKUP_DIR/wg-tool"    2>/dev/null || true
-"$INSTALL_DIR/venv/bin/pip" freeze > "$BACKUP_DIR/pip-freeze.txt" 2>/dev/null || true
+"$INSTALL_DIR/venv/bin/python" -m pip freeze > "$BACKUP_DIR/pip-freeze.txt" 2>/dev/null || true
 echo "$CURRENT_REF" > "$BACKUP_DIR/git-commit.txt"
 
 # Consistent SQLite backup via the backup API (safe while service runs; WAL-aware)
@@ -151,7 +213,19 @@ echo "  Now at v$NEW_VERSION (${TARGET_COMMIT:0:9})"
 # Step 4: Dependencies + import self-test BEFORE touching the install
 # ---------------------------------------------------------------
 echo "[4/8] Installing dependencies + self-test..."
-"$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade flask waitress
+# Self-heal: venv wrapper scripts (pip, etc.) carry an absolute-path shebang
+# to the interpreter. If the install dir was ever renamed, that shebang points
+# at a nonexistent python and every wrapper breaks. Using "python -m pip"
+# sidesteps the wrappers entirely; we also rewrite stale shebangs so other
+# tools that call the wrappers keep working.
+VENV_PY="$INSTALL_DIR/venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+    for w in "$INSTALL_DIR"/venv/bin/pip*; do
+        [[ -f "$w" ]] || continue
+        head -1 "$w" | grep -q '^#!' && sed -i "1s|^#!.*|#!$VENV_PY|" "$w" 2>/dev/null || true
+    done
+fi
+"$VENV_PY" -m pip install --quiet --upgrade flask waitress
 
 if ! "$INSTALL_DIR/venv/bin/python3" -c "
 import importlib.util, sys
@@ -173,7 +247,12 @@ fi
 echo "[5/8] Installing files..."
 install -m 755 "$SCRIPT_DIR/wg-tool" /usr/local/sbin/wg-tool.new && mv -f /usr/local/sbin/wg-tool.new /usr/local/sbin/wg-tool
 install -m 755 "$SCRIPT_DIR/leathguard" /usr/local/bin/leathguard.new && mv -f /usr/local/bin/leathguard.new /usr/local/bin/leathguard
-install -m 644 "$SCRIPT_DIR/wg-panel/app.py" "$INSTALL_DIR/app.py.new" && mv -f "$INSTALL_DIR/app.py.new" "$INSTALL_DIR/app.py"
+mkdir -p /usr/local/lib/leathguard
+install -m 644 "$SCRIPT_DIR/lib/contract.sh" /usr/local/lib/leathguard/contract.sh 2>/dev/null || true
+APP_TARGET="${APP_ENTRY:-$INSTALL_DIR/app.py}"
+if [[ "$APP_TARGET" != "$SCRIPT_DIR/wg-panel/app.py" ]]; then
+    install -m 644 "$SCRIPT_DIR/wg-panel/app.py" "${APP_TARGET}.new" && mv -f "${APP_TARGET}.new" "$APP_TARGET"
+fi
 install -m 644 "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION.new" 2>/dev/null && mv -f "$INSTALL_DIR/VERSION.new" "$INSTALL_DIR/VERSION" || true
 echo "  Files installed"
 
@@ -181,19 +260,23 @@ echo "  Files installed"
 # Step 6: Detect service + port
 # ---------------------------------------------------------------
 echo "[6/8] Detecting service..."
-SERVICE_NAME=""
-for svc in wg-panel wg-panel-home wg-panel-aws wg-panel-raspi wg-panel-test; do
-    if systemctl is-enabled "$svc" &>/dev/null; then SERVICE_NAME="$svc"; break; fi
-done
-[[ -z "$SERVICE_NAME" ]] && SERVICE_NAME=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | grep -oE 'wg-panel[a-z0-9-]*' | head -1 || true)
-[[ -z "$SERVICE_NAME" ]] && SERVICE_NAME="wg-panel"
-
-UNIT_FILE=$(systemctl show -p FragmentPath "$SERVICE_NAME" 2>/dev/null | cut -d= -f2)
-PANEL_PORT=$(grep -oE 'app\.py +[0-9]+' "${UNIT_FILE:-/etc/systemd/system/wg-panel.service}" 2>/dev/null | grep -oE '[0-9]+$' || echo 5000)
-echo "  Service: $SERVICE_NAME (port $PANEL_PORT)"
+if [[ -n "${SERVICE_NAME:-}" && -n "${PANEL_PORT:-}" ]]; then
+    echo "  Service (from contract): $SERVICE_NAME (port $PANEL_PORT)"
+else
+    SERVICE_NAME=""
+    for svc in wg-panel wg-panel-home wg-panel-aws wg-panel-raspi wg-panel-test; do
+        if systemctl is-enabled "$svc" &>/dev/null; then SERVICE_NAME="$svc"; break; fi
+    done
+    [[ -z "$SERVICE_NAME" ]] && SERVICE_NAME=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | grep -oE 'wg-panel[a-z0-9-]*' | head -1 || true)
+    [[ -z "$SERVICE_NAME" ]] && SERVICE_NAME="wg-panel"
+    UNIT_FILE=$(systemctl show -p FragmentPath "$SERVICE_NAME" 2>/dev/null | cut -d= -f2)
+    PANEL_PORT=$(grep -oE 'app\.py +[0-9]+' "${UNIT_FILE:-/etc/systemd/system/wg-panel.service}" 2>/dev/null | grep -oE '[0-9]+$' || echo 5000)
+    echo "  Service (detected): $SERVICE_NAME (port $PANEL_PORT)"
+fi
 
 rollback() {
     echo -e "${RED}  ROLLING BACK to pre-update state...${NC}"
+    lg_notify "Update ROLLED BACK" "v${NEW_VERSION} failed readiness on this box; restored previous version. Bundle: $BACKUP_DIR" 1
     [[ -f "$BACKUP_DIR/app.py" ]]  && cp -f "$BACKUP_DIR/app.py"  "$INSTALL_DIR/app.py"
     [[ -f "$BACKUP_DIR/VERSION" ]] && cp -f "$BACKUP_DIR/VERSION" "$INSTALL_DIR/VERSION"
     [[ -f "$BACKUP_DIR/wg-tool" ]] && cp -f "$BACKUP_DIR/wg-tool" /usr/local/sbin/wg-tool && chmod 755 /usr/local/sbin/wg-tool
@@ -247,6 +330,7 @@ echo ""
 echo "========================================"
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     echo -e "${GREEN}LeathGuard v${NEW_VERSION} running${NC} (${TARGET_COMMIT:0:9})"
+    lg_notify "Updated to v${NEW_VERSION}" "Deploy succeeded (${TARGET_COMMIT:0:9}); readiness check passed."
     echo ""
     echo "Recent logs:"
     journalctl -u "$SERVICE_NAME" -n 3 --no-pager 2>/dev/null | tail -3 || true

@@ -87,7 +87,7 @@ def get_app_version():
                     return f.read().strip()
             except Exception:
                 pass
-    return '6.2.0'  # Fallback default
+    return '6.3.0'  # Fallback default
 
 APP_VERSION = get_app_version()
 
